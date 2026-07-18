@@ -72,6 +72,7 @@ fi
 wine_conf="winedir.conf"
 game_conf="gamedir.conf"
 firstrun_conf="firstrun.conf"
+runtime_conf="runtime.conf"
 
 # Use XDG base directories if defined
 if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/user-dirs.dirs" ]; then
@@ -156,7 +157,11 @@ runner_sources=(
     "LUG Wine" "https://api.github.com/repos/starcitizen-lug/lug-wine/releases"
     "LUG Experimental" "https://api.github.com/repos/starcitizen-lug/lug-wine-experimental/releases"
     "RawFox" "https://api.github.com/repos/starcitizen-lug/raw-wine/releases"
+    "GE-Proton" "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases"
 )
+
+# Persistent install runtime (wine|proton)
+install_runtime="wine"
 
 ######## Requirements ######################################################
 
@@ -654,6 +659,8 @@ getdirs() {
 
     # Initialize a return value
     retval=0
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
 
     # Check if the config files already exist
     if [ -f "$conf_dir/$conf_subdir/$wine_conf" ]; then
@@ -678,18 +685,26 @@ getdirs() {
     # If we don't have the directory paths we need yet,
     # ask the user to provide them
     if [ -z "$wine_prefix" ] || [ -z "$game_path" ]; then
-        message info "At the next screen, please select the directory where you installed Star Citizen (your Wine prefix)\nIt will be remembered for future use.\n\nDefault install path: ~/Games/star-citizen"
+        if [ "$install_runtime" = "proton" ]; then
+            message info "At the next screen, please select the Star Citizen install root directory.\nYour Proton prefix is expected at [install root]/pfx and will be remembered for future use.\n\nDefault install path: ~/Games/star-citizen"
+        else
+            message info "At the next screen, please select the directory where you installed Star Citizen (your ${runtime_label} prefix)\nIt will be remembered for future use.\n\nDefault install path: ~/Games/star-citizen"
+        fi
         if [ "$use_zenity" -eq 1 ]; then
             # Using Zenity file selection menus
             # Get the wine prefix directory
             while [ -z "$wine_prefix" ]; do
-                wine_prefix="$(zenity --file-selection --directory --title="Select your Star Citizen Wine prefix directory" --filename="$HOME/Games/star-citizen" 2>/dev/null)"
+                if [ "$install_runtime" = "proton" ]; then
+                    wine_prefix="$(zenity --file-selection --directory --title="Select your Star Citizen install root directory" --filename="$HOME/Games/star-citizen" 2>/dev/null)"
+                else
+                    wine_prefix="$(zenity --file-selection --directory --title="Select your Star Citizen ${runtime_label} prefix directory" --filename="$HOME/Games/star-citizen" 2>/dev/null)"
+                fi
                 if [ "$?" -eq -1 ]; then
                     message error "An unexpected error has occurred. The Helper is unable to proceed."
                     return 1
                 elif [ -z "$wine_prefix" ]; then
                     # User clicked cancel
-                    message warning "Wine prefix selection cancelled.\nNo changes have been made."
+                    message warning "Directory selection cancelled.\nNo changes have been made."
                     return 1
                 fi
 
@@ -700,13 +715,14 @@ getdirs() {
 
             # Get the game path
             if [ -z "$game_path" ]; then
-                if [ -d "$wine_prefix/$default_install_path" ]; then
+                effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
+                if [ -d "$effective_prefix/$default_install_path" ]; then
                     # Default: prefix/drive_c/Program Files/Roberts Space Industries/StarCitizen
-                    game_path="$wine_prefix/$default_install_path/$sc_base_dir"
+                    game_path="$effective_prefix/$default_install_path/$sc_base_dir"
                 else
-                    message info "Unable to detect the default game install path!\n\n$wine_prefix/$default_install_path/$sc_base_dir\n\nDid you change the install location in the RSI Setup?\nDoing that is generally a bad idea but, if you are sure you want to proceed,\nselect your '$sc_base_dir' game directory on the next screen"
+                    message info "Unable to detect the default game install path!\n\n$effective_prefix/$default_install_path/$sc_base_dir\n\nDid you change the install location in the RSI Setup?\nDoing that is generally a bad idea but, if you are sure you want to proceed,\nselect your '$sc_base_dir' game directory on the next screen"
                     while true; do
-                        game_path="$(zenity --file-selection --directory --title="Select your Star Citizen directory" --filename="$wine_prefix/$default_install_path" 2>/dev/null)"
+                        game_path="$(zenity --file-selection --directory --title="Select your Star Citizen directory" --filename="$effective_prefix/$default_install_path" 2>/dev/null)"
 
                         if [ "$?" -eq -1 ]; then
                             message error "An unexpected error has occurred. The Helper is unable to proceed."
@@ -729,7 +745,11 @@ getdirs() {
             clear
             # Get the wine prefix directory
             if [ -z "$wine_prefix" ]; then
-                printf "Enter the full path to your Star Citizen Wine prefix directory (case sensitive)\n"
+                if [ "$install_runtime" = "proton" ]; then
+                    printf "Enter the full path to your Star Citizen install root directory (case sensitive)\n"
+                else
+                    printf "Enter the full path to your Star Citizen %s prefix directory (case sensitive)\n" "$runtime_label"
+                fi
                 printf "ie. /home/USER/Games/star-citizen\n"
                 while read -rp ": " wine_prefix; do
                     if [ ! -d "$wine_prefix" ]; then
@@ -742,9 +762,10 @@ getdirs() {
 
             # Get the game path
             if [ -z "$game_path" ]; then
-                if [ -d "$wine_prefix/$default_install_path/s" ]; then
+                effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
+                if [ -d "$effective_prefix/$default_install_path" ]; then
                     # Default: prefix/drive_c/Program Files/Roberts Space Industries/StarCitizen
-                    game_path="$wine_prefix/$default_install_path/$sc_base_dir"
+                    game_path="$effective_prefix/$default_install_path/$sc_base_dir"
                 else
                     printf "\nUnable to detect the default game install path!\nDid you change the install location in the RSI Setup?\nDoing that is generally a bad idea but, if you are sure you want to proceed...\n\n"
                     printf "Enter the full path to your %s installation directory (case sensitive)\n" "$sc_base_dir"
@@ -775,6 +796,572 @@ getdirs() {
     fi
 
     return "$retval"
+}
+
+# MARK: load_install_runtime()
+# Load persisted install runtime and default to wine if unset/invalid
+load_install_runtime() {
+    install_runtime="wine"
+
+    if [ -f "$conf_dir/$conf_subdir/$runtime_conf" ]; then
+        runtime_value="$(cat "$conf_dir/$conf_subdir/$runtime_conf")"
+        if [ "$runtime_value" = "wine" ] || [ "$runtime_value" = "proton" ]; then
+            install_runtime="$runtime_value"
+        fi
+    fi
+}
+
+# MARK: save_install_runtime()
+# Persist the selected install runtime
+save_install_runtime() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The save_install_runtime function expects one argument. Aborting."
+    fi
+
+    runtime_value="$1"
+    if [ "$runtime_value" != "wine" ] && [ "$runtime_value" != "proton" ]; then
+        debug_print exit "Script error: Invalid runtime passed to save_install_runtime. Aborting."
+    fi
+
+    mkdir -p "$conf_dir/$conf_subdir"
+    echo "$runtime_value" > "$conf_dir/$conf_subdir/$runtime_conf"
+    install_runtime="$runtime_value"
+}
+
+# MARK: get_runtime_label()
+# Return display label for the current install runtime
+get_runtime_label() {
+    if [ "$install_runtime" = "proton" ]; then
+        printf "Proton"
+    else
+        printf "Wine"
+    fi
+}
+
+# MARK: get_runner_source_runtime()
+# Return runtime type for an even-numbered runner source index
+get_runner_source_runtime() {
+    if [ "$#" -lt 1 ]; then
+        printf "wine"
+        return 0
+    fi
+
+    source_index="$1"
+    source_url="${runner_sources[$((source_index+1))]}"
+
+    # Derive runtime directly from the source URL.
+    # Expected patterns include repo names containing "proton" or "wine".
+    if printf "%s" "$source_url" | grep -qi "proton"; then
+        source_runtime="proton"
+    else
+        source_runtime="wine"
+    fi
+
+    if [ "$source_runtime" = "proton" ]; then
+        printf "proton"
+    else
+        printf "wine"
+    fi
+}
+
+# MARK: detect_install_runtime_from_root()
+# Detect whether an install root is Wine or Proton based on layout/script/runners.
+detect_install_runtime_from_root() {
+    if [ "$#" -lt 1 ]; then
+        printf ""
+        return 1
+    fi
+
+    install_root="$1"
+    if [ -z "$install_root" ] || [ ! -d "$install_root" ]; then
+        printf ""
+        return 1
+    fi
+
+    proton_score=0
+    wine_score=0
+
+    # Launch script hints are the strongest signal.
+    if [ -f "$install_root/$launch_script_name" ]; then
+        launch_wineprefix="$(grep "^export WINEPREFIX=" "$install_root/$launch_script_name" | awk -F '=' '{print $2}' | tr -d '"')"
+        launch_winepath="$(grep -e "^export wine_path=" -e "^wine_path=" "$install_root/$launch_script_name" | awk -F '=' '{print $2}' | tr -d '"')"
+
+        if [ -n "$launch_wineprefix" ] && [ "$(basename "$launch_wineprefix")" = "pfx" ]; then
+            proton_score="$((proton_score+3))"
+        elif [ -n "$launch_wineprefix" ] && [ "$launch_wineprefix" = "$install_root" ]; then
+            wine_score="$((wine_score+3))"
+        fi
+
+        if printf "%s" "$launch_winepath" | grep -qi "proton"; then
+            proton_score="$((proton_score+3))"
+        elif [ -n "$launch_winepath" ] && printf "%s" "$launch_winepath" | grep -qi "wine"; then
+            wine_score="$((wine_score+1))"
+        fi
+    fi
+
+    # Prefix layout hints.
+    if [ -d "$install_root/pfx" ]; then
+        proton_score="$((proton_score+2))"
+    fi
+    if [ -d "$install_root/pfx/$default_install_path" ]; then
+        proton_score="$((proton_score+2))"
+    fi
+    if [ -d "$install_root/$default_install_path" ]; then
+        wine_score="$((wine_score+2))"
+    fi
+
+    # Runner names in local runners directory.
+    if [ -d "$install_root/runners" ]; then
+        for local_runner in "$install_root/runners"/*; do
+            if [ ! -d "$local_runner" ]; then
+                continue
+            fi
+
+            local_runner_name="$(basename "$local_runner")"
+            if printf "%s" "$local_runner_name" | grep -qiE 'proton|cachy|ge-proton|experimental|hotfix'; then
+                proton_score="$((proton_score+1))"
+            elif printf "%s" "$local_runner_name" | grep -qiE 'lug-wine|raw-wine|wine'; then
+                wine_score="$((wine_score+1))"
+            fi
+        done
+    fi
+
+    if [ "$proton_score" -gt "$wine_score" ]; then
+        printf "proton"
+    elif [ "$wine_score" -gt "$proton_score" ]; then
+        printf "wine"
+    else
+        printf ""
+    fi
+}
+
+# MARK: detect_and_save_runtime_for_target_install()
+# Detect runtime for currently targeted install root and persist runtime lock.
+detect_and_save_runtime_for_target_install() {
+    if [ -z "$wine_prefix" ] || [ ! -d "$wine_prefix" ]; then
+        return 1
+    fi
+
+    load_install_runtime
+    previous_runtime="$install_runtime"
+    detected_runtime="$(detect_install_runtime_from_root "$wine_prefix")"
+
+    if [ -z "$detected_runtime" ]; then
+        detected_runtime="$previous_runtime"
+    fi
+
+    save_install_runtime "$detected_runtime"
+
+    if [ "$detected_runtime" != "$previous_runtime" ]; then
+        if [ "$detected_runtime" = "proton" ]; then
+            message info "Detected a Proton-style installation at:\n${wine_prefix}\n\nRuntime lock has been switched to Proton."
+        else
+            message info "Detected a Wine-style installation at:\n${wine_prefix}\n\nRuntime lock has been switched to Wine."
+        fi
+    fi
+
+    return 0
+}
+
+# MARK: current_target_install_is_valid()
+# Return success if currently targeted install looks valid for Wine or Proton.
+# Sets helper globals for menu usage:
+# - current_target_install_root
+# - current_target_install_runtime
+# - current_target_effective_prefix
+current_target_install_is_valid() {
+    unset current_target_install_root
+    unset current_target_install_runtime
+    unset current_target_effective_prefix
+
+    if [ ! -f "$conf_dir/$conf_subdir/$wine_conf" ]; then
+        return 1
+    fi
+
+    current_target_install_root="$(cat "$conf_dir/$conf_subdir/$wine_conf")"
+    if [ -z "$current_target_install_root" ] || [ ! -d "$current_target_install_root" ]; then
+        return 1
+    fi
+
+    current_target_install_runtime="$(detect_install_runtime_from_root "$current_target_install_root")"
+    if [ -z "$current_target_install_runtime" ]; then
+        return 1
+    fi
+
+    if [ "$current_target_install_runtime" = "proton" ]; then
+        if [ "$(basename "$current_target_install_root")" = "pfx" ]; then
+            current_target_effective_prefix="$current_target_install_root"
+        else
+            current_target_effective_prefix="$current_target_install_root/pfx"
+        fi
+    else
+        if [ -d "$current_target_install_root/pfx" ] && [ ! -d "$current_target_install_root/$default_install_path" ]; then
+            current_target_effective_prefix="$current_target_install_root/pfx"
+        else
+            current_target_effective_prefix="$current_target_install_root"
+        fi
+    fi
+
+    if [ -d "$current_target_effective_prefix/$default_install_path/$sc_base_dir" ] || [ -f "$current_target_install_root/$launch_script_name" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# MARK: fetch_url_text()
+# Fetch URL contents with retries. Prints response body to stdout.
+fetch_url_text() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The fetch_url_text function expects one argument. Aborting."
+    fi
+
+    fetch_url="$1"
+    curl --silent --show-error --location \
+        --connect-timeout 10 --max-time 45 \
+        --retry 2 --retry-delay 1 \
+        "$fetch_url"
+}
+
+# MARK: fetch_github_api_json()
+# Fetch GitHub API JSON and capture HTTP code / message for error reporting.
+fetch_github_api_json() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The fetch_github_api_json function expects one argument. Aborting."
+    fi
+
+    github_api_url="$1"
+    api_last_http_code=""
+    api_last_error_message=""
+
+    api_response_file="$(mktemp -p "$tmp_dir" github-api.XXXXXX)"
+
+    if [ -n "$GITHUB_TOKEN" ]; then
+        api_http_code="$(curl --silent --show-error --location \
+            --connect-timeout 10 --max-time 45 \
+            --retry 2 --retry-delay 1 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            --output "$api_response_file" \
+            --write-out "%{http_code}" \
+            "$github_api_url")"
+    else
+        api_http_code="$(curl --silent --show-error --location \
+            --connect-timeout 10 --max-time 45 \
+            --retry 2 --retry-delay 1 \
+            -H "Accept: application/vnd.github+json" \
+            --output "$api_response_file" \
+            --write-out "%{http_code}" \
+            "$github_api_url")"
+    fi
+    api_curl_status="$?"
+
+    api_last_http_code="$api_http_code"
+
+    if [ -f "$api_response_file" ]; then
+        api_last_error_message="$(grep -Eo '"message"[[:space:]]*:[[:space:]]*"[^"]+"' "$api_response_file" | head -n 1 | cut -d '"' -f4)"
+    fi
+
+    if [ "$api_curl_status" -ne 0 ]; then
+        rm -f "$api_response_file"
+        return 1
+    fi
+
+    case "$api_http_code" in
+        2??)
+            cat "$api_response_file"
+            rm -f "$api_response_file"
+            return 0
+            ;;
+        *)
+            rm -f "$api_response_file"
+            return 1
+            ;;
+    esac
+}
+
+# MARK: github_repo_from_api_releases_url()
+# Convert a GitHub API releases URL into owner/repo.
+github_repo_from_api_releases_url() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The github_repo_from_api_releases_url function expects one argument. Aborting."
+    fi
+
+    github_api_url="$1"
+    repo_part="${github_api_url#https://api.github.com/repos/}"
+    repo_part="${repo_part%%/releases*}"
+    printf "%s" "$repo_part"
+}
+
+# MARK: github_release_assets_from_html()
+# Fallback parser for GitHub release asset URLs when API is unavailable.
+github_release_assets_from_html() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The github_release_assets_from_html function expects one argument. Aborting."
+    fi
+
+    github_repo="$1"
+    latest_release_url="https://github.com/${github_repo}/releases/latest"
+    latest_effective_url="$(curl --silent --show-error --location \
+        --connect-timeout 10 --max-time 45 \
+        --retry 2 --retry-delay 1 \
+        --output /dev/null \
+        --write-out "%{url_effective}" \
+        "$latest_release_url")"
+    latest_tag="${latest_effective_url##*/}"
+
+    if [ -n "$latest_tag" ] && [ "$latest_tag" != "latest" ]; then
+        release_html_url="https://github.com/${github_repo}/releases/expanded_assets/${latest_tag}"
+    else
+        release_html_url="https://github.com/${github_repo}/releases"
+    fi
+
+    fetch_url_text "$release_html_url" |
+        grep -Eo 'href="/[^"]+/releases/download/[^"]+"' |
+        cut -d '"' -f2 |
+        sed 's#^#https://github.com#'
+}
+
+# MARK: build_runtime_runner_sources()
+# Build download_sources array containing only sources matching install_runtime
+build_runtime_runner_sources() {
+    unset download_sources
+
+    for (( i=0; i<"${#runner_sources[@]}"; i=i+2 )); do
+        source_runtime="$(get_runner_source_runtime "$i")"
+        if [ "$source_runtime" = "$install_runtime" ]; then
+            download_sources+=("${runner_sources[$i]}" "${runner_sources[$i+1]}")
+        fi
+    done
+}
+
+# MARK: detect_local_proton_runners()
+# Detect Proton runners installed in common local/Steam locations.
+detect_local_proton_runners() {
+    unset local_cachyos_runner_names
+    unset local_cachyos_runner_paths
+    unset local_custom_proton_runner_names
+    unset local_custom_proton_runner_paths
+    unset local_steam_runner_names
+    unset local_steam_runner_paths
+    unset local_seen_runner_paths
+
+    local_runner_search_paths=(
+        "$HOME/.steam/root/compatibilitytools.d"
+        "$HOME/.steam/steam/compatibilitytools.d"
+        "$HOME/.steam/debian-installation/compatibilitytools.d"
+        "$HOME/.local/share/Steam/compatibilitytools.d"
+        "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"
+        "$HOME/.var/app/com.valvesoftware.Steam/.steam/steam/compatibilitytools.d"
+        "/usr/share/steam/compatibilitytools.d"
+        "/usr/lib/steam/compatibilitytools.d"
+        "/usr/lib64/steam/compatibilitytools.d"
+        "$HOME/.steam/root/steamapps/common"
+        "$HOME/.steam/steam/steamapps/common"
+        "$HOME/.steam/debian-installation/steamapps/common"
+        "$HOME/.local/share/Steam/steamapps/common"
+        "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/common"
+        "$HOME/.var/app/com.valvesoftware.Steam/.steam/steam/steamapps/common"
+    )
+
+    for runner_parent in "${local_runner_search_paths[@]}"; do
+        if [ ! -d "$runner_parent" ]; then
+            continue
+        fi
+
+        for runner_dir in "$runner_parent"/*; do
+            if [ ! -d "$runner_dir" ]; then
+                continue
+            fi
+
+            runner_name="$(basename "$runner_dir")"
+            runner_bin_dir="$(resolve_runner_bin_path "$runner_dir")"
+            runner_real_dir="$(realpath "$runner_dir" 2>/dev/null)"
+
+            if [ -z "$runner_real_dir" ]; then
+                runner_real_dir="$runner_dir"
+            fi
+
+            if [ "${#local_seen_runner_paths[@]}" -gt 0 ] && printf "%s\n" "${local_seen_runner_paths[@]}" | grep -Fxq "$runner_real_dir"; then
+                continue
+            fi
+
+            if [ ! -x "$runner_bin_dir/wine" ] || [ ! -x "$runner_bin_dir/wineserver" ]; then
+                continue
+            fi
+
+            # Only treat actual Proton compatibility tools as local runners.
+            # This avoids misclassifying ordinary Steam game directories.
+            if [ ! -f "$runner_dir/proton" ] && [ ! -f "$runner_dir/toolmanifest.vdf" ] && [ ! -f "$runner_dir/compatibilitytool.vdf" ]; then
+                continue
+            fi
+
+            # Skip local runners that are not executable on this host architecture.
+            "$runner_bin_dir/wineserver" -v >/dev/null 2>&1
+            if [ "$?" -eq 126 ]; then
+                continue
+            fi
+
+            # Classify sources so they can be shown as separate menu entries.
+            if printf "%s" "$runner_name" | grep -qiE 'cachy|cachyos'; then
+                local_cachyos_runner_names+=("$runner_name")
+                local_cachyos_runner_paths+=("$runner_real_dir")
+                local_seen_runner_paths+=("$runner_real_dir")
+            elif printf "%s" "$runner_name" | grep -qiE '^proton([[:space:]-]|$)|experimental|hotfix'; then
+                local_steam_runner_names+=("$runner_name")
+                local_steam_runner_paths+=("$runner_real_dir")
+                local_seen_runner_paths+=("$runner_real_dir")
+            else
+                local_custom_proton_runner_names+=("$runner_name")
+                local_custom_proton_runner_paths+=("$runner_real_dir")
+                local_seen_runner_paths+=("$runner_real_dir")
+            fi
+        done
+    done
+}
+
+# MARK: append_local_proton_runner_sources()
+# Append detected local Proton sources to the dynamic download_sources list.
+append_local_proton_runner_sources() {
+    detect_local_proton_runners
+
+    if [ "${#local_cachyos_runner_names[@]}" -gt 0 ]; then
+        download_sources+=("CachyOS Proton (Local)" "local://cachyos-proton")
+    fi
+
+    if [ "${#local_custom_proton_runner_names[@]}" -gt 0 ]; then
+        download_sources+=("Proton Compatibility Tools (Local)" "local://custom-proton")
+    fi
+
+    if [ "${#local_steam_runner_names[@]}" -gt 0 ]; then
+        download_sources+=("Steam Proton (Local)" "local://steam-proton")
+    fi
+}
+
+# MARK: install_local_runner()
+# Configure a detected local runner directly from its existing location.
+install_local_runner() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The install_local_runner function expects one argument. Aborting."
+    fi
+
+    local_idx="$1"
+    local_runner_name="${local_select_runner_names[$local_idx]}"
+    local_runner_path="${local_select_runner_paths[$local_idx]}"
+
+    if [ -z "$local_runner_name" ] || [ -z "$local_runner_path" ] || [ ! -d "$local_runner_path" ]; then
+        message warning "The selected local runner is no longer available."
+        return 1
+    fi
+
+    unset downloaded_item_name
+    local_runner_bin_path="$(resolve_runner_bin_path "$local_runner_path")"
+    if [ ! -x "$local_runner_bin_path/wine" ] || [ ! -x "$local_runner_bin_path/wineserver" ]; then
+        message warning "The selected local runner is missing required binaries."
+        return 1
+    fi
+
+    installed_runner_bin_path="$local_runner_bin_path"
+    installed_runner_name="$local_runner_name"
+    post_download_required="installed"
+    return 0
+}
+
+# MARK: get_default_runner_source_index()
+# Return preferred runner source index for the current runtime.
+get_default_runner_source_index() {
+    load_install_runtime
+
+    preferred_source_name=""
+    if [ "$install_runtime" = "proton" ]; then
+        preferred_source_name="GE-Proton"
+    else
+        preferred_source_name="LUG Wine"
+    fi
+
+    # Prefer named defaults when present.
+    for (( i=0; i<"${#runner_sources[@]}"; i=i+2 )); do
+        source_name="${runner_sources[$i]}"
+        source_runtime="$(get_runner_source_runtime "$i")"
+        if [ "$source_name" = "$preferred_source_name" ] && [ "$source_runtime" = "$install_runtime" ]; then
+            printf "%s" "$i"
+            return 0
+        fi
+    done
+
+    # Fallback to first source matching runtime.
+    for (( i=0; i<"${#runner_sources[@]}"; i=i+2 )); do
+        source_runtime="$(get_runner_source_runtime "$i")"
+        if [ "$source_runtime" = "$install_runtime" ]; then
+            printf "%s" "$i"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# MARK: resolve_effective_wineprefix()
+# Resolve the effective WINEPREFIX path from the configured install root.
+resolve_effective_wineprefix() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The resolve_effective_wineprefix function expects one argument. Aborting."
+    fi
+
+    prefix_root="$1"
+    load_install_runtime
+
+    # Support both layouts during transition: root-as-prefix and root/pfx.
+    if [ "$install_runtime" = "proton" ]; then
+        if [ "$(basename "$prefix_root")" = "pfx" ]; then
+            printf "%s" "$prefix_root"
+        else
+            printf "%s" "$prefix_root/pfx"
+        fi
+    else
+        if [ -d "$prefix_root/pfx" ] && [ ! -d "$prefix_root/$default_install_path" ]; then
+            printf "%s" "$prefix_root/pfx"
+        else
+            printf "%s" "$prefix_root"
+        fi
+    fi
+}
+
+# MARK: resolve_runner_bin_path()
+# Return the runner bin path for Wine/Proton layouts
+resolve_runner_bin_path() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The resolve_runner_bin_path function expects one argument. Aborting."
+    fi
+
+    runner_root="$1"
+    if [ -d "$runner_root/files/bin" ]; then
+        printf "%s" "$runner_root/files/bin"
+    elif [ -d "$runner_root/bin" ]; then
+        printf "%s" "$runner_root/bin"
+    else
+        printf "%s" "$runner_root/bin"
+    fi
+}
+
+# MARK: resolve_runner_root_from_bin_path()
+# Return the runner root given a bin directory path.
+resolve_runner_root_from_bin_path() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The resolve_runner_root_from_bin_path function expects one argument. Aborting."
+    fi
+
+    runner_bin_path="$1"
+    if [ "$(basename "$runner_bin_path")" = "bin" ]; then
+        runner_parent="$(dirname "$runner_bin_path")"
+        if [ "$(basename "$runner_parent")" = "files" ]; then
+            printf "%s" "$(dirname "$runner_parent")"
+        else
+            printf "%s" "$runner_parent"
+        fi
+    else
+        printf "%s" "$runner_bin_path"
+    fi
 }
 
 
@@ -1265,13 +1852,15 @@ download_manage() {
 
     # Get the type of item we're downloading from the function arguments
     download_type="$1"
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
 
     # The download management menu will loop until the user cancels
     looping_menu="true"
     while [ "$looping_menu" = "true" ]; do
         # Configure the menu
-        menu_text_zenity="<b><big>Manage Your $download_menu_heading</big>\n\n$download_menu_description</b>\n\nWine prefix: <a href='file://$wine_prefix'>$wine_prefix</a>"
-        menu_text_terminal="Manage Your $download_menu_heading\n\n$download_menu_description\nWine prefix: $wine_prefix"
+        menu_text_zenity="<b><big>Manage Your $download_menu_heading</big>\n\n$download_menu_description</b>\n\n${runtime_label} prefix: <a href='file://$wine_prefix'>$wine_prefix</a>"
+        menu_text_terminal="Manage Your $download_menu_heading\n\n$download_menu_description\n${runtime_label} prefix: $wine_prefix"
         menu_text_height="$download_menu_height"
         menu_type="radiolist"
         main_menu="false"
@@ -1283,6 +1872,8 @@ download_manage() {
 
         # Initialize success
         unset post_download_required
+        unset installed_runner_bin_path
+        unset installed_runner_name
 
         # Set variables for the current wine runner configured in the launch script
         if [ "$download_type" = "runner" ]; then
@@ -1292,8 +1883,14 @@ download_manage() {
         # Loop through the download_sources array and create a menu item
         # for each one. Even numbered elements will contain the item name
         for (( i=0; i<"${#download_sources[@]}"; i=i+2 )); do
+            if [ "$download_type" = "runner" ] && printf "%s" "${download_sources[$i+1]}" | grep -q '^local://'; then
+                source_action_label="Select a"
+            else
+                source_action_label="Install a"
+            fi
+
             # Set the options to be displayed in the menu
-            menu_options+=("Install a $download_type from ${download_sources[i]}")
+            menu_options+=("${source_action_label} $download_type from ${download_sources[i]}")
             # Set the corresponding functions to be called for each of the options
             menu_actions+=("download_select_install $i")
         done
@@ -1330,15 +1927,24 @@ runner_manage() {
     # Valid options are "none" or "configure-wine"
     post_download_type="configure-wine"
 
-    # Use indirect expansion to point download_sources
-    # to the runner_sources array set at the top of the script
-    declare -n download_sources=runner_sources
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
+
+    # Build source list for the selected install runtime only.
+    build_runtime_runner_sources
+    if [ "$install_runtime" = "proton" ]; then
+        append_local_proton_runner_sources
+    fi
+    if [ "${#download_sources[@]}" -eq 0 ]; then
+        message warning "No ${runtime_label} runner sources are configured."
+        return 1
+    fi
 
     # Get directories so we know where the wine prefix is
     getdirs
     if [ "$?" -eq 1 ]; then
         # User cancelled getdirs or there was an error
-        message warning "Unable to install a Wine runner in the configured Wine prefix."
+        message warning "Unable to install a ${runtime_label} runner in the configured ${runtime_label} prefix."
         return 1
     fi
 
@@ -1346,16 +1952,16 @@ runner_manage() {
     set_latest_default_runner
     # Sanity check
     if [ "$?" -eq 1 ]; then
-        message warning "Could not fetch the latest default wine runner.\nThe Github API may be down. Check if you are rate limited and try again later."
+        message warning "Could not fetch the latest default ${runtime_label} runner.\nThe Github API may be down. Check if you are rate limited and try again later."
         return 1
     fi
 
-    # Set the download directory for wine runners
+    # Set the download directory for runners
     download_dir="$wine_prefix/runners"
 
     # Configure the text displayed in the menus
-    download_menu_heading="Wine Runners"
-    download_menu_description="The runners listed below are wine builds created for Star Citizen"
+    download_menu_heading="${runtime_label} Runners"
+    download_menu_description="The runners listed below are ${runtime_label} builds created for Star Citizen"
     download_menu_height="320"
 
     # Set the string sed will match against when editing the launch script
@@ -1364,7 +1970,7 @@ runner_manage() {
     post_download_sed_string="export wine_path="
     # Set the value of the above variable that will be restored after a runner is deleted
     # In this case, we want to revert to the configured default wine runner
-    post_delete_restore_value="${download_dir}/${default_runner}/bin"
+    post_delete_restore_value="$(resolve_runner_bin_path "${download_dir}/${default_runner}")"
 
     # Call the download_manage function with the above configuration
     # The argument passed to the function is used for special handling
@@ -1398,6 +2004,77 @@ download_select_install() {
     contributor_name="${download_sources[$1]}"
     contributor_url="${download_sources[$1+1]}"
 
+    # Enforce runtime lock for this installation.
+    if printf "%s" "$contributor_url" | grep -qi "proton"; then
+        source_runtime="proton"
+    else
+        source_runtime="wine"
+    fi
+    if [ "$download_type" = "runner" ] && [ "$source_runtime" != "$install_runtime" ]; then
+        message warning "This installation is locked to $(get_runtime_label) runners.\n\nSelected source: ${contributor_name}"
+        return 1
+    fi
+
+    # Handle local runner sources without remote API calls.
+    if [ "$download_type" = "runner" ] && printf "%s" "$contributor_url" | grep -q '^local://'; then
+        unset local_select_runner_names
+        unset local_select_runner_paths
+
+        if [ "$contributor_url" = "local://cachyos-proton" ]; then
+            local_select_runner_names=("${local_cachyos_runner_names[@]}")
+            local_select_runner_paths=("${local_cachyos_runner_paths[@]}")
+        elif [ "$contributor_url" = "local://custom-proton" ]; then
+            local_select_runner_names=("${local_custom_proton_runner_names[@]}")
+            local_select_runner_paths=("${local_custom_proton_runner_paths[@]}")
+        elif [ "$contributor_url" = "local://steam-proton" ]; then
+            local_select_runner_names=("${local_steam_runner_names[@]}")
+            local_select_runner_paths=("${local_steam_runner_paths[@]}")
+        else
+            message warning "Unknown local runner source: ${contributor_name}"
+            return 1
+        fi
+
+        if [ "${#local_select_runner_names[@]}" -eq 0 ]; then
+            message warning "No local runners were found for ${contributor_name}."
+            return 1
+        fi
+
+        menu_text_zenity="Select the runner you want to use:"
+        menu_text_terminal="Select the runner you want to use:"
+        menu_text_height="320"
+        menu_type="radiolist"
+        main_menu="false"
+        unset menu_options
+        unset menu_actions
+
+        for (( i=0; i<"${#local_select_runner_names[@]}"; i++ )); do
+            local_runner_name="${local_select_runner_names[$i]}"
+            local_runner_path="${local_select_runner_paths[$i]}"
+
+            unset menu_option_text
+            if [ "$download_type" = "runner" ] && [ "$current_runner_path" = "$local_runner_path" ]; then
+                menu_option_text="$local_runner_name    [in-use]"
+            else
+                menu_option_text="$local_runner_name"
+            fi
+
+            menu_options+=("$menu_option_text")
+            menu_actions+=("install_local_runner $i")
+        done
+
+        menu_options+=("goback")
+        menu_actions+=(":")
+
+        menu_height="$(($menu_option_height * ${#menu_options[@]} + $menu_text_height + $menu_text_height_zenity4))"
+        if [ "$menu_height" -gt "$menu_height_max" ]; then
+            menu_height="$menu_height_max"
+        fi
+
+        cancel_label="Go Back"
+        menu
+        return 0
+    fi
+
     # For runners, check GlibC version against runner requirements
     if [ "$download_type" = "runner" ]; then
 
@@ -1408,6 +2085,8 @@ download_select_install() {
         elif [ "$contributor_name" = "LUG Wine" ]; then
             required_glibc="2.39"
         elif [ "$contributor_name" = "LUG Experimental" ]; then
+            required_glibc="2.39"
+        elif [ "$contributor_name" = "GE-Proton" ]; then
             required_glibc="2.39"
         else
             required_glibc="0.00"
@@ -1442,6 +2121,7 @@ download_select_install() {
     # To add new sources, handle them here, in the if statement
     # just above, and in the download_install function
     if [ "$download_url_type" = "github" ]; then
+        unset arch_filter_keywords
         # Which json key are we looking for?
         search_key="browser_download_url"
         # Optional: Only match urls containing a keyword
@@ -1450,10 +2130,27 @@ download_select_install() {
         # Format for grep extended regex (ie: "word1|word2|word3")
         if [ "$download_type" = "runner" ] && [ "$contributor_name" = "GloriousEggroll" ]; then
             filter_keywords="lol|diablo"
+        elif [ "$download_type" = "runner" ] && [ "$contributor_name" = "GE-Proton" ]; then
+            filter_keywords="oh hi there. this is just placeholder text. how are you today?"
+            system_arch="$(uname -m)"
+            case "$system_arch" in
+                x86_64 | amd64)
+                    arch_filter_keywords="aarch64|arm64|armv[0-9]+|armhf|armel|riscv64|ppc64|ppc64le"
+                    ;;
+                aarch64 | arm64)
+                    arch_filter_keywords="x86_64|amd64|x64|i[3-6]86|x86|wow64"
+                    ;;
+                *)
+                    arch_filter_keywords="oh hi there. this is just placeholder text. how are you today?"
+                    ;;
+            esac
         elif [ "$download_type" = "runner" ] && [ "$contributor_name" = "Kron4ek" ]; then
             filter_keywords="x86|wow64"
         else
             filter_keywords="oh hi there. this is just placeholder text. how are you today?"
+        fi
+        if [ -z "$arch_filter_keywords" ]; then
+            arch_filter_keywords="oh hi there. this is just placeholder text. how are you today?"
         fi
         # Add a query string to the url
         query_string="?per_page=$max_download_items"
@@ -1465,6 +2162,7 @@ download_select_install() {
         # Optional: Filter out game-specific builds by keyword
         # Format for grep extended regex (ie: "word1|word2|word3")
         filter_keywords="oh hi there. this is just placeholder text. how are you today?"
+        arch_filter_keywords="oh hi there. this is just placeholder text. how are you today?"
         # Add a query string to the url
         query_string="?per_page=$max_download_items"
     else
@@ -1473,14 +2171,44 @@ download_select_install() {
 
     # Fetch a list of versions from the selected contributor
     unset download_versions
-    while IFS='' read -r line; do
-        download_versions+=("$line")
-    done < <(curl -s "$contributor_url$query_string" | grep -Eo "\"$search_key\": ?\"[^\"]+\"" | grep "$match_url_keyword" | cut -d '"' -f4 | cut -d '?' -f1 | xargs basename -a | grep -viE "$filter_keywords")
-    # Note: match from search_key until " or EOL (Handles embedded commas and escaped quotes). Cut out quotes and gitlab's extraneous query strings.
+    api_request_url="${contributor_url}${query_string}"
+    api_payload=""
+    if [ "$download_url_type" = "github" ]; then
+        api_payload="$(fetch_github_api_json "$api_request_url")"
+    else
+        api_payload="$(fetch_url_text "$api_request_url")"
+    fi
+
+    if [ -n "$api_payload" ]; then
+        while IFS='' read -r line; do
+            download_versions+=("$line")
+        done < <(printf "%s\n" "$api_payload" | grep -Eo "\"$search_key\": ?\"[^\"]+\"" | grep "$match_url_keyword" | cut -d '"' -f4 | cut -d '?' -f1 | xargs basename -a | grep -viE "$filter_keywords" | grep -viE "$arch_filter_keywords")
+    fi
+
+    # Fallback: if GitHub API failed or returned nothing, parse the HTML releases page.
+    if [ "${#download_versions[@]}" -eq 0 ] && [ "$download_url_type" = "github" ]; then
+        github_repo="$(github_repo_from_api_releases_url "$contributor_url")"
+        if [ -n "$github_repo" ]; then
+            while IFS='' read -r asset_url; do
+                asset_name="$(basename "${asset_url%%\?*}")"
+                if printf "%s\n" "$asset_name" | grep -qiE "$filter_keywords"; then
+                    continue
+                fi
+                if printf "%s\n" "$asset_name" | grep -qiE "$arch_filter_keywords"; then
+                    continue
+                fi
+                download_versions+=("$asset_name")
+            done < <(github_release_assets_from_html "$github_repo" | grep -E "$match_url_keyword" | awk '!seen[$0]++')
+        fi
+    fi
 
     # Sanity check
     if [ "${#download_versions[@]}" -eq 0 ]; then
-        message warning "No $download_type versions were found.\nThe $download_url_type API may be down. Check if you are rate limited and try again later."
+        if [ "$download_url_type" = "github" ] && [ -n "$api_last_http_code" ]; then
+            message warning "No $download_type versions were found.\nGitHub API request failed (HTTP ${api_last_http_code}).\n${api_last_error_message}\n\nTip: set GITHUB_TOKEN to avoid rate limits, then try again."
+        else
+            message warning "No $download_type versions were found.\nThe $download_url_type API may be down. Check if you are rate limited and try again later."
+        fi
         return 1
     fi
 
@@ -1597,13 +2325,17 @@ download_install() {
         debug_print exit "Script error: The string 'download_dir' was not set before calling the download_install function. Aborting."
     fi
 
+    unset installed_runner_bin_path
+    unset installed_runner_name
+
     # Before swapping wine runners in an existing install, check if the prefix is active
     if [ "$download_type" = "runner" ] && [ -n "$wine_prefix" ] && [ -f "${launcher_winepath}/wineserver" ]; then
-        if ! WINEPREFIX="${wine_prefix}" timeout 0.2s "${launcher_winepath}"/wineserver -w; then
+        effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
+        if ! WINEPREFIX="${effective_prefix}" timeout 0.2s "${launcher_winepath}"/wineserver -w; then
             # Prefix is active
             if message question "A program appears to be running in your Wine prefix!\nTo avoid problems, it's recommended to close all Wine programs before continuing.\n\nDo you want to terminate all Wine processes and proceed?"; then
                 # Kill all wine processes and then continue on
-                WINEPREFIX="${wine_prefix}" "${launcher_winepath}"/wineserver -k
+                WINEPREFIX="${effective_prefix}" "${launcher_winepath}"/wineserver -k
             else
                 return 0
             fi
@@ -1681,11 +2413,33 @@ download_install() {
     fi
 
     # Get the selected download url
-    download_url="$(curl -s "$contributor_url$query_string" | grep -Eo "\"$search_key\": ?\"[^\"]+\"" | grep "$download_filename" | cut -d '"' -f4 | cut -d '?' -f1 | sed 's|/-/blob/|/-/raw/|')"
+    api_request_url="${contributor_url}${query_string}"
+    api_payload=""
+    if [ "$download_url_type" = "github" ]; then
+        api_payload="$(fetch_github_api_json "$api_request_url")"
+    else
+        api_payload="$(fetch_url_text "$api_request_url")"
+    fi
+
+    if [ -n "$api_payload" ]; then
+        download_url="$(printf "%s\n" "$api_payload" | grep -Eo "\"$search_key\": ?\"[^\"]+\"" | grep "$download_filename" | cut -d '"' -f4 | cut -d '?' -f1 | sed 's|/-/blob/|/-/raw/|')"
+    fi
+
+    # Fallback: parse GitHub releases HTML when API is unavailable.
+    if [ -z "$download_url" ] && [ "$download_url_type" = "github" ]; then
+        github_repo="$(github_repo_from_api_releases_url "$contributor_url")"
+        if [ -n "$github_repo" ]; then
+            download_url="$(github_release_assets_from_html "$github_repo" | grep "/${download_filename}$" | head -n 1)"
+        fi
+    fi
 
     # Sanity check
     if [ -z "$download_url" ]; then
-        message warning "Could not find the requested ${download_type}.\nThe $download_url_type API may be down. Check if you are rate limited and try again later."
+        if [ "$download_url_type" = "github" ] && [ -n "$api_last_http_code" ]; then
+            message warning "Could not find the requested ${download_type}.\nGitHub API request failed (HTTP ${api_last_http_code}).\n${api_last_error_message}\n\nTip: set GITHUB_TOKEN to avoid rate limits, then try again."
+        else
+            message warning "Could not find the requested ${download_type}.\nThe $download_url_type API may be down. Check if you are rate limited and try again later."
+        fi
         return 1
     fi
 
@@ -1792,6 +2546,10 @@ download_select_delete() {
     # Find all installed items in the download destination
     if [ -d "$download_dir" ]; then
         for item in "$download_dir"/*; do
+            if [ -L "$item" ]; then
+                continue
+            fi
+
             if [ -d "$item" ]; then
                 installed_item_names+=("$(basename "$item")")
                 installed_items+=("$item")
@@ -1960,20 +2718,31 @@ post_download() {
 
         # We handle installs and deletions differently
         if [ "$post_download_required" = "installed" ] && [ "$download_type" = "runner" ]; then
-            # We are installing a wine version and updating the launch script to use it
+            runtime_label="$(get_runtime_label)"
+            # We are installing a runner version and updating the launch script to use it
 
             # Replace the specified variable in the launch script
+            if [ -n "$installed_runner_bin_path" ]; then
+                runner_bin_path="$installed_runner_bin_path"
+                runner_display_name="${installed_runner_name:-$(basename "$(resolve_runner_root_from_bin_path "$runner_bin_path")")}"
+                runner_action_message="${runtime_label} runner selection updated!"
+            else
+                runner_bin_path="$(resolve_runner_bin_path "${wine_prefix}/runners/${downloaded_item_name}")"
+                runner_display_name="$downloaded_item_name"
+                runner_action_message="${runtime_label} runner installation complete!"
+            fi
             debug_print continue "Updating \"${post_download_sed_string}\" variable in launch script ${wine_prefix}/${launch_script_name}..."
-            sed -i "s|^${post_download_sed_string}.*|${post_download_sed_string}\"${wine_prefix}/runners/${downloaded_item_name}/bin\"|" "$wine_prefix/$launch_script_name"
+            sed -i "s|^${post_download_sed_string}.*|${post_download_sed_string}\"${runner_bin_path}\"|" "$wine_prefix/$launch_script_name"
 
             # Display a confirmation message
-            message info "Wine Runner installation complete!"
+            message info "${runner_action_message}\n\nUsing: ${runner_display_name}"
         elif [ "$post_download_required" = "deleted" ] && [ "$download_type" = "runner" ]; then
             # We deleted a custom wine version and need to revert the launch script to use the default wine runner
+            runtime_label="$(get_runtime_label)"
 
             # Check if the default wine runner is installed
             if [ ! -d "${download_dir}/${default_runner}" ]; then
-                message info "The Wine runner currently used by your launch script has been deleted!\n\nThe default Wine runner will now be downloaded and installed."
+                message info "The ${runtime_label} runner currently used by your launch script has been deleted!\n\nThe default ${runtime_label} runner will now be downloaded and installed."
                 # Install the default wine runner into the prefix
                 download_wine
                 # Make sure the wine download worked
@@ -1982,7 +2751,7 @@ post_download() {
                     return 1
                 fi
             else
-                message info "The Wine runner currently used by your launch script has been deleted!\n\nYour launch script will be updated to use the default Wine runner."
+                message info "The ${runtime_label} runner currently used by your launch script has been deleted!\n\nYour launch script will be updated to use the default ${runtime_label} runner."
             fi
 
             # Replace the specified variable in the launch script
@@ -2072,6 +2841,8 @@ download_file() {
 # MARK: maintenance_menu()
 # Show maintenance/troubleshooting options
 maintenance_menu() {
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
     # Loop the menu until the user selects quit
     looping_menu="true"
     while [ "$looping_menu" = "true" ]; do
@@ -2089,8 +2860,14 @@ maintenance_menu() {
         fi
 
         # Configure the menu
-        menu_text_zenity="<b><big>Game Maintenance and Troubleshooting</big>\n\nLUG Wiki: $lug_wiki</b>\n\nWine prefix:$prefix_missing_text <a href='file://$game_prefix'>$game_prefix</a>"
-        menu_text_terminal="Game Maintenance and Troubleshooting\n\nLUG Wiki: $lug_wiki\n\nWine prefix:$prefix_missing_text $game_prefix"
+        if [ "$install_runtime" = "proton" ] && [ "$game_prefix" != "Not configured" ]; then
+            effective_prefix="$(resolve_effective_wineprefix "$game_prefix")"
+            menu_text_zenity="<b><big>Game Maintenance and Troubleshooting</big>\n\nLUG Wiki: $lug_wiki</b>\n\nInstall root:$prefix_missing_text <a href='file://$game_prefix'>$game_prefix</a>\nProton prefix: <a href='file://$effective_prefix'>$effective_prefix</a>"
+            menu_text_terminal="Game Maintenance and Troubleshooting\n\nLUG Wiki: $lug_wiki\n\nInstall root:$prefix_missing_text $game_prefix\nProton prefix: $effective_prefix"
+        else
+            menu_text_zenity="<b><big>Game Maintenance and Troubleshooting</big>\n\nLUG Wiki: $lug_wiki</b>\n\n${runtime_label} prefix:$prefix_missing_text <a href='file://$game_prefix'>$game_prefix</a>"
+            menu_text_terminal="Game Maintenance and Troubleshooting\n\nLUG Wiki: $lug_wiki\n\n${runtime_label} prefix:$prefix_missing_text $game_prefix"
+        fi
         menu_text_height="320"
         menu_type="radiolist"
         main_menu="false"
@@ -2099,20 +2876,19 @@ maintenance_menu() {
         prefix_msg="Target a different Star Citizen installation"
         launcher_msg="Update/Repair launch script"
         launchscript_msg="Edit launch script"
-        config_msg="Open Wine prefix configuration"
-        controllers_msg="Open Wine controller configuration"
+        config_msg="Open ${runtime_label} prefix configuration"
+        controllers_msg="Open ${runtime_label} controller configuration"
         udev_msg="Create joystick hidraw rules"
-        powershell_msg="Install PowerShell into Wine prefix"
+        powershell_msg="Install PowerShell into ${runtime_label} prefix"
         rsi_launcher_msg="Update/Re-install RSI Launcher"
         dirs_msg="List Helper & Star Citizen directories and files"
         logs_msg="Show logs"
         reset_msg="Reset Helper configs"
-        uninstall_msg="Uninstall Star Citizen"
 
         # Set the options to be displayed in the menu
-        menu_options=("$prefix_msg" "$launcher_msg" "$launchscript_msg" "$config_msg" "$controllers_msg" "$udev_msg" "$powershell_msg" "$rsi_launcher_msg" "$dirs_msg" "$logs_msg" "$reset_msg" "$uninstall_msg" "menu_loop_done")
+        menu_options=("$prefix_msg" "$launcher_msg" "$launchscript_msg" "$config_msg" "$controllers_msg" "$udev_msg" "$powershell_msg" "$rsi_launcher_msg" "$dirs_msg" "$logs_msg" "$reset_msg" "menu_loop_done")
         # Set the corresponding functions to be called for each of the options
-        menu_actions=("switch_prefix" "update_launch_script" "edit_launch_script" "call_launch_script config" "call_launch_script controllers" "create_joystick_rules" "install_powershell" "reinstall_rsi_launcher" "display_dirs" "show_logs" "reset_helper" "uninstall_game" "menu_loop_done")
+        menu_actions=("switch_prefix" "update_launch_script" "edit_launch_script" "call_launch_script config" "call_launch_script controllers" "create_joystick_rules" "install_powershell" "reinstall_rsi_launcher" "display_dirs" "show_logs" "reset_helper" "menu_loop_done")
 
         # Calculate the total height the menu should be
         # menu_option_height = pixels per menu option
@@ -2135,16 +2911,32 @@ switch_prefix() {
     # Check if the config file exists
     if [ -f "$conf_dir/$conf_subdir/$wine_conf" ] && [ -f "$conf_dir/$conf_subdir/$game_conf" ]; then
         getdirs
+        getdirs_ret="$?"
+
+        if [ "$getdirs_ret" -eq 1 ]; then
+            return 1
+        fi
+
         # Above will return code 3 if the user had to select new directories. This can happen if the stored directories are now invalid.
         # We check this so we don't prompt the user to set directories twice here.
-        if [ "$?" -ne 3 ] && message question "The Helper is currently targeting this Star Citizen install\nWould you like to change it?\n\n$wine_prefix"; then
+        if [ "$getdirs_ret" -eq 3 ]; then
+            detect_and_save_runtime_for_target_install
+        elif message question "The Helper is currently targeting this Star Citizen install\nWould you like to change it?\n\n$wine_prefix"; then
             reset_helper "switchprefix"
             # Prompt the user for a new set of game paths
             getdirs
+            if [ "$?" -eq 1 ]; then
+                return 1
+            fi
+            detect_and_save_runtime_for_target_install
         fi
     else
         # Prompt the user for game paths
         getdirs
+        if [ "$?" -eq 1 ]; then
+            return 1
+        fi
+        detect_and_save_runtime_for_target_install
     fi
 }
 
@@ -2159,6 +2951,8 @@ update_launch_script() {
         message warning "Unable to update launch script."
         return 0
     fi
+
+    effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
 
     # Verify the launch script template exists
     if [ ! -f "$launch_script_template" ]; then
@@ -2216,17 +3010,17 @@ update_launch_script() {
             fi
 
             # Store the new Wine binary path
-            launcher_winepath="$wine_prefix/runners/$downloaded_item_name/bin"
+            launcher_winepath="$(resolve_runner_bin_path "$wine_prefix/runners/$downloaded_item_name")"
         fi
 
         # Copy in the new launch script
         cp "$launch_script_template" "$wine_prefix"
 
         # Restore the wine prefix variable
-        if [ "$launcher_wineprefix" != "$wine_prefix" ]; then
+        if [ "$launcher_wineprefix" != "$effective_prefix" ]; then
             # Offer to fix an incorrectly referenced wine prefix
-            if message question "Your launch script is pointing to the wrong Wine prefix.\nWould you like to update it to use the correct prefix?\n\nCurrent prefix in launch script:\n${launcher_wineprefix}\n\nCorrect prefix:\n${wine_prefix}"; then
-                sed -i "s|^export WINEPREFIX=.*|export WINEPREFIX=\"$wine_prefix\"|" "$wine_prefix/$launch_script_name"
+            if message question "Your launch script is pointing to the wrong Wine prefix.\nWould you like to update it to use the correct prefix?\n\nCurrent prefix in launch script:\n${launcher_wineprefix}\n\nCorrect prefix:\n${effective_prefix}"; then
+                sed -i "s|^export WINEPREFIX=.*|export WINEPREFIX=\"$effective_prefix\"|" "$wine_prefix/$launch_script_name"
             fi
         else
             # Restore the backed up prefix variable if the user doesn't want to change it
@@ -2243,15 +3037,15 @@ update_launch_script() {
         copy_icons
 
         message info "Your game launch script has been updated!\n\nIf you had customized your script, you'll need to re-add your changes.\nA backup was created at:\n\n$wine_prefix/$(basename "$launch_script_name" .sh).bak"
-    elif [ "$launcher_wineprefix" != "$wine_prefix" ]; then
+    elif [ "$launcher_wineprefix" != "$effective_prefix" ]; then
         # The launch script is the correct version, but the current prefix is pointing to the wrong location
 
         # Copy the bundled icons to the .local icons directory if they don't already exist
         copy_icons
 
-        if [ "$update_template" = "true" ] || message question "Your launch script is pointing to the wrong Wine prefix.\nWould you like to update it to use the correct prefix?\n\nCurrent prefix in launch script:\n${launcher_wineprefix}\n\nCorrect prefix:\n${wine_prefix}"; then
+        if [ "$update_template" = "true" ] || message question "Your launch script is pointing to the wrong Wine prefix.\nWould you like to update it to use the correct prefix?\n\nCurrent prefix in launch script:\n${launcher_wineprefix}\n\nCorrect prefix:\n${effective_prefix}"; then
             # Update WINEPREFIX line
-            sed -i "s|^export WINEPREFIX=.*|export WINEPREFIX=\"${wine_prefix}\"|" "${wine_prefix}/${launch_script_name}"
+            sed -i "s|^export WINEPREFIX=.*|export WINEPREFIX=\"${effective_prefix}\"|" "${wine_prefix}/${launch_script_name}"
 
             # wine_path will also be wrong. For simplicity, install the default wine runner into the prefix and use that
             download_dir="${wine_prefix}/runners"
@@ -2263,7 +3057,7 @@ update_launch_script() {
             fi
 
             # Update Wine binary in game launch script
-            wine_path="$wine_prefix/runners/$downloaded_item_name/bin"
+            wine_path="$(resolve_runner_bin_path "$wine_prefix/runners/$downloaded_item_name")"
             post_download_sed_string="export wine_path="
             sed -i "s|^${post_download_sed_string}.*|${post_download_sed_string}\"${wine_path}\"|" "${wine_prefix}/${launch_script_name}"
 
@@ -2285,7 +3079,7 @@ update_launch_script() {
         fi
 
         # Update Wine binary in game launch script
-        wine_path="$wine_prefix/runners/$downloaded_item_name/bin"
+        wine_path="$(resolve_runner_bin_path "$wine_prefix/runners/$downloaded_item_name")"
         post_download_sed_string="export wine_path="
         sed -i "s|^${post_download_sed_string}.*|${post_download_sed_string}\"${wine_path}\"|" "${wine_prefix}/${launch_script_name}"
 
@@ -2352,6 +3146,9 @@ call_launch_script() {
 
     launch_arg="$1"
 
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
+
     # Get/Set directory paths
     getdirs
     if [ "$?" -eq 1 ]; then
@@ -2364,6 +3161,35 @@ call_launch_script() {
     if [ ! -f "$wine_prefix/$launch_script_name" ]; then
         message error "Unable to find $wine_prefix/$launch_script_name"
         return 1
+    fi
+
+    # Handle maintenance commands directly so they work even if the copied
+    # launch script is out of date.
+    if [ "$launch_arg" = "config" ] || [ "$launch_arg" = "controllers" ]; then
+        get_current_runner
+        if [ "$?" -ne 1 ]; then
+            launcher_winepath="${launcher_winepath}"
+        else
+            launcher_winepath="$(command -v wine | xargs dirname)"
+            launcher_winepath="${launcher_winepath:-/usr/bin}"
+        fi
+
+        effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
+        export WINEPREFIX="$effective_prefix"
+
+        if [ "$launch_arg" = "config" ]; then
+            "$launcher_winepath"/wine winecfg
+        else
+            "$launcher_winepath"/wine control joy.cpl
+        fi
+
+        exit_code="$?"
+        if [ "$exit_code" -ne 0 ]; then
+            message warning "Unable to open ${runtime_label} configuration. See terminal output for details."
+            return 1
+        fi
+
+        return 0
     fi
 
     # Check if the launch script is the correct version
@@ -2403,12 +3229,10 @@ create_joystick_rules() {
 # MARK: install_powershell()
 # Install powershell verb into the game's wine prefix
 install_powershell() {
-    # Download winetricks
-    download_winetricks
-
-    # Abort if the winetricks download failed
+    # Select tricks backend for the locked runtime.
+    set_compat_tricks
     if [ "$?" -eq 1 ]; then
-        message error "Unable to install powershell without winetricks. Aborting."
+        message error "Unable to install powershell without a compatible tricks backend. Aborting."
         return 1
     fi
 
@@ -2428,14 +3252,15 @@ install_powershell() {
         export WINESERVER="$launcher_winepath/wineserver"
     fi
     # Set the correct wine prefix
-    export WINEPREFIX="$wine_prefix"
+    effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
+    export WINEPREFIX="$effective_prefix"
 
     # Show a zenity pulsating progress bar
     progress_bar start "Installing PowerShell. Please wait..."
 
     # Install powershell
-    debug_print continue "Installing PowerShell into ${wine_prefix}..."
-    "$winetricks_bin" -q powershell
+    debug_print continue "Installing PowerShell into ${effective_prefix}..."
+    "$tricks_bin" -q powershell
 
     exit_code="$?"
     if [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 126 ]; then
@@ -2459,12 +3284,6 @@ reinstall_rsi_launcher() {
         return 1
     fi
 
-    # Delete the RSI Launcher's AppData directory (fixes some broken launcher issues)
-    if [ -d "${wine_prefix}/${rsilauncher_appdata_path}" ]; then
-        debug_print continue "Deleting RSI Launcher AppData directory:\n${wine_prefix}/${rsilauncher_appdata_path}..."
-        rm -r --interactive=never "${wine_prefix}/${rsilauncher_appdata_path}"
-    fi
-
     download_rsi_installer
     # Abort if the download failed
     if [ "$?" -eq 1 ]; then
@@ -2484,8 +3303,15 @@ reinstall_rsi_launcher() {
     fi
 
     # Set the correct wine prefix
-    export WINEPREFIX="$wine_prefix"
+    effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
+    export WINEPREFIX="$effective_prefix"
     export WINEDLLOVERRIDES="dxwebsetup.exe,dotNetFx45_Full_setup.exe,winemenubuilder.exe=d"
+
+    # Delete the RSI Launcher's AppData directory (fixes some broken launcher issues)
+    if [ -d "${effective_prefix}/${rsilauncher_appdata_path}" ]; then
+        debug_print continue "Deleting RSI Launcher AppData directory:\n${effective_prefix}/${rsilauncher_appdata_path}..."
+        rm -r --interactive=never "${effective_prefix}/${rsilauncher_appdata_path}"
+    fi
 
     # Show a zenity pulsating progress bar
     progress_bar start "Installing RSI Launcher. Please wait..."
@@ -2493,14 +3319,36 @@ reinstall_rsi_launcher() {
     # Run the installer
     debug_print continue "Installing RSI Launcher. Please wait; this will take a moment..."
     "$launcher_winepath"/wine "$tmp_dir/$rsi_installer" /S
+    installer_exit_code="$?"
 
-    exit_code="$?"
-    if [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 58 ]; then
+    # Some installer versions spawn child processes and return early.
+    # Wait for the prefix to go idle before deciding success/failure.
+    "$launcher_winepath"/wineserver -w
+    wineserver_wait_exit_code="$?"
+
+    if [ "$installer_exit_code" -eq 1 ] || [ "$installer_exit_code" -eq 58 ] || [ "$wineserver_wait_exit_code" -ne 0 ]; then
         # User cancelled or there was an error
         "$launcher_winepath"/wineserver -k # Kill all wine processes
         progress_bar stop # Stop the zenity progress window
         message error "Installation aborted. See terminal output for details."
         return 1
+    fi
+
+    # Fallback: if silent install did not place the launcher, try non-silent once.
+    rsi_launcher_exe_path="${effective_prefix}/${default_install_path}/RSI Launcher/RSI Launcher.exe"
+    if [ ! -f "$rsi_launcher_exe_path" ]; then
+        debug_print continue "RSI Launcher executable not detected after silent install. Retrying installer without /S..."
+        "$launcher_winepath"/wine "$tmp_dir/$rsi_installer"
+        installer_exit_code="$?"
+        "$launcher_winepath"/wineserver -w
+        wineserver_wait_exit_code="$?"
+
+        if [ "$installer_exit_code" -eq 1 ] || [ "$installer_exit_code" -eq 58 ] || [ "$wineserver_wait_exit_code" -ne 0 ]; then
+            "$launcher_winepath"/wineserver -k
+            progress_bar stop
+            message error "Installation aborted. See terminal output for details."
+            return 1
+        fi
     fi
 
     # Stop the zenity progress window
@@ -2515,6 +3363,8 @@ reinstall_rsi_launcher() {
 # MARK: display_dirs()
 # Display all directories and files currently used by this helper and Star Citizen
 display_dirs() {
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
     dirs_list="\n"
 
     # Helper config files
@@ -2527,9 +3377,10 @@ display_dirs() {
         fi
     fi
 
-    # Wine prefix
+    # Install root and effective runtime prefix
     if [ -f "$conf_dir/$conf_subdir/$wine_conf" ]; then
         wine_prefix="$(cat "$conf_dir/$conf_subdir/$wine_conf")"
+        effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
 
         # Add a warning if the prefix has been deleted
         prefix_missing_text=""
@@ -2537,10 +3388,17 @@ display_dirs() {
             prefix_missing_text=" (missing!)"
         fi
 
+        runtime_prefix_missing_text=""
+        if [ ! -d "$effective_prefix" ]; then
+            runtime_prefix_missing_text=" (missing!)"
+        fi
+
         if [ "$use_zenity" -eq 1 ]; then
-            dirs_list+="Wine prefix:${prefix_missing_text}\n<a href='file://${wine_prefix}'>${wine_prefix}</a>\n\n"
+            dirs_list+="Install root:${prefix_missing_text}\n<a href='file://${wine_prefix}'>${wine_prefix}</a>\n\n"
+            dirs_list+="${runtime_label} prefix:${runtime_prefix_missing_text}\n<a href='file://${effective_prefix}'>${effective_prefix}</a>\n\n"
         else
-            dirs_list+="Wine prefix:${prefix_missing_text}\n${wine_prefix}\n\n"
+            dirs_list+="Install root:${prefix_missing_text}\n${wine_prefix}\n\n"
+            dirs_list+="${runtime_label} prefix:${runtime_prefix_missing_text}\n${effective_prefix}\n\n"
         fi
     fi
 
@@ -2610,33 +3468,36 @@ display_dirs() {
 # MARK: show_logs()
 # Display game log files
 show_logs() {
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
     logs_list="\n"
 
-    # Verify the configured wine prefix exists
+    # Verify the configured installation exists
     if [ -f "$conf_dir/$conf_subdir/$wine_conf" ]; then
         wine_prefix="$(cat "$conf_dir/$conf_subdir/$wine_conf")"
+        effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
 
-        if [ ! -d "$wine_prefix" ]; then
-            message warning "The configured Wine prefix was not found! No logs to show.\n\n${wine_prefix}\n\nUse the menu option to target the correct installation."
+        if [ ! -d "$effective_prefix" ]; then
+            message warning "The configured ${runtime_label} prefix was not found! No logs to show.\n\n${effective_prefix}\n\nUse the menu option to target the correct installation."
             return 0
         fi
     else
-        message warning "No Wine prefix configured! No logs to show.\n\nUse the menu option to target the correct installation."
+        message warning "No ${runtime_label} prefix configured! No logs to show.\n\nUse the menu option to target the correct installation."
         return 0
     fi
 
-    # Wine sc-launch.log
-    wine_log="${wine_prefix}/sc-launch.log"
+    # Runtime sc-launch.log
+    wine_log="${effective_prefix}/sc-launch.log"
     if [ -f "$wine_log" ]; then
         if [ "$use_zenity" -eq 1 ]; then
-            logs_list+="Wine log:\n<a href='file://${wine_log}'>${wine_log}</a>\n\n"
+            logs_list+="${runtime_label} log:\n<a href='file://${wine_log}'>${wine_log}</a>\n\n"
         else
-            logs_list+="Wine log:\n${wine_log}\n\n"
+            logs_list+="${runtime_label} log:\n${wine_log}\n\n"
         fi
     fi
 
     # RSI Launcher log
-    rsilauncher_log="${wine_prefix}/${rsilauncher_appdata_path}/logs/log.log"
+    rsilauncher_log="${effective_prefix}/${rsilauncher_appdata_path}/logs/log.log"
     if [ -f "$rsilauncher_log" ]; then
         if [ "$use_zenity" -eq 1 ]; then
             logs_list+="RSI Launcher log:\n<a href='file://${rsilauncher_log}'>${rsilauncher_log}</a>\n\n"
@@ -2646,7 +3507,7 @@ show_logs() {
     fi
 
     # Game log
-    game_log="${wine_prefix}/${default_install_path}/${sc_base_dir}/LIVE/Game.log"
+    game_log="${effective_prefix}/${default_install_path}/${sc_base_dir}/LIVE/Game.log"
     if [ -f "$game_log" ]; then
         if [ "$use_zenity" -eq 1 ]; then
             logs_list+="Game log:\n<a href='file://${game_log}'>${game_log}</a>\n\n"
@@ -2656,7 +3517,7 @@ show_logs() {
     fi
 
     # EAC log
-    eac_settings_json="${wine_prefix}/${default_install_path}/${sc_base_dir}/LIVE/EasyAntiCheat/Settings.json"
+    eac_settings_json="${effective_prefix}/${default_install_path}/${sc_base_dir}/LIVE/EasyAntiCheat/Settings.json"
     if [ -f "$eac_settings_json" ]; then
         productid="$(awk -F'"' '/"productid":/ {print $4}' "$eac_settings_json")"
         deploymentid="$(awk -F'"' '/"deploymentid":/ {print $4}' "$eac_settings_json")"
@@ -2664,8 +3525,8 @@ show_logs() {
         if [ -z "$productid" ] || [ -z "$deploymentid" ]; then
             debug_print continue "Script error: Could not parse EasyAntiCheat/Settings.json. The file format may have changed. Please report this error."
         else
-            eac_log="${wine_prefix}/${eac_appdata_path}/${productid}/${deploymentid}/anticheatlauncher.log"
-            eac_log_linebreak="${wine_prefix}/${eac_appdata_path}/\n${productid}/${deploymentid}/anticheatlauncher.log"
+            eac_log="${effective_prefix}/${eac_appdata_path}/${productid}/${deploymentid}/anticheatlauncher.log"
+            eac_log_linebreak="${effective_prefix}/${eac_appdata_path}/\n${productid}/${deploymentid}/anticheatlauncher.log"
 
             if [ -f "$eac_log" ]; then
                 if [ "$use_zenity" -eq 1 ]; then
@@ -2699,8 +3560,8 @@ reset_helper() {
     if [ "$1" = "switchprefix" ]; then
         # This gets called by the switch_prefix, install_game, and uninstall_game functions
         # We only want to delete configs related to the game path in order to target a different game install
-        debug_print continue "Deleting $conf_dir/$conf_subdir/{$wine_conf,$game_conf}..."
-        rm --interactive=never "${conf_dir:?}/$conf_subdir/"{"$wine_conf","$game_conf"}
+        debug_print continue "Deleting $conf_dir/$conf_subdir/{$wine_conf,$game_conf,$runtime_conf}..."
+        rm --interactive=never "${conf_dir:?}/$conf_subdir/"{"$wine_conf","$game_conf","$runtime_conf"}
     elif message question "All config files will be deleted from:\n\n$conf_dir/$conf_subdir\n\nDo you want to proceed?"; then
         # Called normally by the user, wipe all the things!
         debug_print continue "Deleting $conf_dir/$conf_subdir/*.conf..."
@@ -2715,13 +3576,17 @@ reset_helper() {
 # MARK: uninstall_game()
 # Uninstall the game by deleting the Wine prefix and any other installed files
 uninstall_game() {
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
     # Fetch wine prefix
     getdirs
     if [ "$?" -eq 1 ]; then
         # User cancelled getdirs or there was an error
-        message warning "Unable to uninstall the configured Wine prefix."
+        message warning "Unable to uninstall the configured ${runtime_label} installation."
         return 1
     fi
+
+    effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
 
     # Populate the list of existing .desktop files
     set_desktop_file_paths
@@ -2741,7 +3606,7 @@ uninstall_game() {
         desktop_list="\n.desktop files:\n${desktop_list}"
     fi
 
-    if message question "The following files and directories will be deleted:\n\nWine prefix:\n${wine_prefix}\n${desktop_list}\nDo you want to proceed?"; then
+    if message question "The following files and directories will be deleted:\n\nInstall root:\n${wine_prefix}\n\n${runtime_label} prefix:\n${effective_prefix}\n${desktop_list}\nDo you want to proceed?"; then
         # Delete wine prefix
         debug_print continue "Deleting $wine_prefix..."
         rm -r --interactive=never "$wine_prefix"
@@ -2780,19 +3645,23 @@ uninstall_game() {
 ############################################################################
 
 # MARK: dxvk_menu()
-# Menu to select and install a dxvk into the wine prefix
+# Menu to select and install DXVK into the runtime prefix
 dxvk_menu() {
-    # Fetch wine prefix
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
+    # Fetch install paths
     getdirs
     if [ "$?" -eq 1 ]; then
         # User cancelled getdirs or there was an error
-        message warning "Unable to update dxvk in the configured Wine prefix."
+        message warning "Unable to update DXVK in the configured ${runtime_label} prefix."
         return 1
     fi
 
+    effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
+
     # Configure the menu
-    menu_text_zenity="<b><big>Manage Your DXVK Version</big>\n\nSelect which DXVK you'd like to update or install</b>\n\nWine prefix: <a href='file://$wine_prefix'>$wine_prefix</a>"
-    menu_text_terminal="Manage Your DXVK Version\n\nSelect which DXVK you'd like to update or install\nWine prefix: $wine_prefix"
+    menu_text_zenity="<b><big>Manage Your DXVK Version</big>\n\nSelect which DXVK you'd like to update or install</b>\n\n${runtime_label} prefix: <a href='file://$effective_prefix'>$effective_prefix</a>"
+    menu_text_terminal="Manage Your DXVK Version\n\nSelect which DXVK you'd like to update or install\n${runtime_label} prefix: $effective_prefix"
     menu_text_height="300"
     menu_type="radiolist"
     main_menu="false"
@@ -2822,7 +3691,7 @@ dxvk_menu() {
 }
 
 # MARK: install_dxvk()
-# Entry function to install or update DXVK in the wine prefix
+# Entry function to install or update DXVK in the runtime prefix
 #
 # Requires one argument to specify which type of dxvk to install
 # Supports "standard", "async", "nvapi"
@@ -2838,8 +3707,9 @@ install_dxvk() {
         export WINE="$launcher_winepath/wine"
         export WINESERVER="$launcher_winepath/wineserver"
     fi
-    # Set the correct wine prefix
-    export WINEPREFIX="$wine_prefix"
+    # Set the correct runtime prefix
+    effective_prefix="$(resolve_effective_wineprefix "$wine_prefix")"
+    export WINEPREFIX="$effective_prefix"
 
     if [ "$1" = "standard" ]; then
         install_standard_dxvk
@@ -2853,26 +3723,24 @@ install_dxvk() {
 }
 
 # MARK: install_standard_dxvk()
-# Install or update standard dxvk in the wine prefix
+# Install or update standard DXVK in the runtime prefix
 #
 # Expects that getdirs has already been called
 # Expects that the env vars WINE, WINESERVER, and WINEPREFIX are already set
 install_standard_dxvk() {
-    # Download winetricks
-    download_winetricks
-
-    # Abort if the winetricks download failed
+    # Select tricks backend for the locked runtime.
+    set_compat_tricks
     if [ "$?" -eq 1 ]; then
-        message error "Unable to update dxvk without winetricks. Aborting."
+        message error "Unable to update dxvk without a compatible tricks backend. Aborting."
         return 1
     fi
 
     # Show a zenity pulsating progress bar
     progress_bar start "Updating DXVK. Please wait..."
-    debug_print continue "Updating DXVK in ${wine_prefix}..."
+    debug_print continue "Updating DXVK in ${WINEPREFIX}..."
 
     # Update dxvk
-    "$winetricks_bin" -f dxvk
+    "$tricks_bin" -f dxvk
 
     exit_code="$?"
     if [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 126 ]; then
@@ -2885,26 +3753,24 @@ install_standard_dxvk() {
 }
 
 # MARK: install_async_dxvk()
-# Install or update async dxvk in the wine prefix
+# Install or update async DXVK in the runtime prefix
 #
 # Expects that getdirs has already been called
 # Expects that the env vars WINE, WINESERVER, and WINEPREFIX are already set
 install_async_dxvk() {
-    # Download winetricks
-    download_winetricks
-
-    # Abort if the winetricks download failed
+    # Select tricks backend for the locked runtime.
+    set_compat_tricks
     if [ "$?" -eq 1 ]; then
-        message error "Unable to update dxvk without winetricks. Aborting."
+        message error "Unable to update dxvk without a compatible tricks backend. Aborting."
         return 1
     fi
 
     # Show a zenity pulsating progress bar
     progress_bar start "Updating DXVK. Please wait..."
-    debug_print continue "Updating DXVK in ${wine_prefix}..."
+    debug_print continue "Updating DXVK in ${WINEPREFIX}..."
 
     # Update dxvk
-    "$winetricks_bin" -f dxvk_async
+    "$tricks_bin" -f dxvk_async
 
     # Check for errors
     exit_code="$?"
@@ -2949,26 +3815,24 @@ install_async_dxvk() {
 }
 
 # MARK: install_dxvk_nvapi()
-# Install or update dxvk-nvapi in the wine prefix
+# Install or update DXVK-NVAPI in the runtime prefix
 #
 # Expects that getdirs has already been called
 # Expects that the env vars WINE, WINESERVER, and WINEPREFIX are already set
 install_dxvk_nvapi() {
-    # Download winetricks
-    download_winetricks
-
-    # Abort if the winetricks download failed
+    # Select tricks backend for the locked runtime.
+    set_compat_tricks
     if [ "$?" -eq 1 ]; then
-        message error "Unable to install dxvk_nvapi without winetricks. Aborting."
+        message error "Unable to install dxvk_nvapi without a compatible tricks backend. Aborting."
         return 1
     fi
 
     # Show a zenity pulsating progress bar
     progress_bar start "Installing DXVK-NVAPI. Please wait..."
-    debug_print continue "Installing DXVK-NVAPI in ${wine_prefix}..."
+    debug_print continue "Installing DXVK-NVAPI in ${WINEPREFIX}..."
 
     # Update dxvk
-    "$winetricks_bin" -f dxvk_nvapi
+    "$tricks_bin" -f dxvk_nvapi
 
     exit_code="$?"
     if [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 126 ]; then
@@ -2987,6 +3851,18 @@ install_dxvk_nvapi() {
 # MARK: install_game()
 # Install the game with Wine
 install_game() {
+    load_install_runtime
+
+    # Lock runtime on first install and persist it for future operations.
+    if [ ! -f "$conf_dir/$conf_subdir/$runtime_conf" ]; then
+        if message question "Install using Wine runtime?\n\nSelect 'No' to install using Proton runtime (GE-Proton)."; then
+            save_install_runtime "wine"
+        else
+            save_install_runtime "proton"
+        fi
+    fi
+    runtime_label="$(get_runtime_label)"
+
     # Check if the launch script template exists
     if [ ! -f "$launch_script_template" ]; then
         message error "Game launch script not found! Unable to proceed.\n\n$launch_script_template\n\nIt is included in our official releases here:\n$releases_url"
@@ -2999,7 +3875,7 @@ install_game() {
 
     # Display a warning message
     if [ "$glibc_fail" = "true" ]; then
-        message error "Your glibc version is incompatible with the default Wine runner! You may need to update your OS.\n\nSystem glibc: ${system_glibc}\nMinimum required glibc: $required_glibc"
+        message error "Your glibc version is incompatible with the default ${runtime_label} runner! You may need to update your OS.\n\nSystem glibc: ${system_glibc}\nMinimum required glibc: $required_glibc"
         return 1
     fi
 
@@ -3018,13 +3894,20 @@ install_game() {
 
     # Initialize re-install flag
     move_datap4k="false"
+    install_prefix=""
 
     # Get the install path from the user
     if message question "Would you like to use the default install path?\n\n$HOME/Games/star-citizen"; then
         # Set the default install path
         install_dir="$HOME/Games/star-citizen"
+
+        if [ "$install_runtime" = "proton" ]; then
+            install_prefix="$install_dir/pfx"
+        else
+            install_prefix="$install_dir"
+        fi
         
-        # Are we trying to re-install over an existing prefix?
+        # Are we trying to re-install over an existing install root?
         if [ -d "$install_dir" ] && [ -n "$(ls -A "$install_dir")" ]; then
             # star-citizen exists and is not empty
 
@@ -3057,7 +3940,13 @@ install_game() {
                 install_dir="$install_dir/star-citizen"
             fi
 
-            # Are we trying to re-install over an existing prefix?
+            if [ "$install_runtime" = "proton" ]; then
+                install_prefix="$install_dir/pfx"
+            else
+                install_prefix="$install_dir"
+            fi
+
+            # Are we trying to re-install over an existing install root?
             if [ -d "$install_dir" ] && [ -n "$(ls -A "$install_dir")" ]; then
                 # Back up the old install and check for a Data.p4k file. Sets the move_datap4k flag based on results.
                 prepare_reinstall "$install_dir"
@@ -3081,6 +3970,12 @@ install_game() {
                     *)
                         ;;
                 esac
+
+                if [ "$install_runtime" = "proton" ]; then
+                    install_prefix="$install_dir/pfx"
+                else
+                    install_prefix="$install_dir"
+                fi
 
                 if [ -z "$install_dir" ]; then
                     printf "Invalid directory. Please try again.\n\n"
@@ -3106,8 +4001,17 @@ install_game() {
         fi
     fi
 
+    if [ -z "$install_prefix" ]; then
+        if [ "$install_runtime" = "proton" ]; then
+            install_prefix="$install_dir/pfx"
+        else
+            install_prefix="$install_dir"
+        fi
+    fi
+
     # Create the game path
     mkdir -p "$install_dir"
+    mkdir -p "$install_prefix"
 
     # EAC doesn't like >10.0 wine or wow64 wine (all new wines are wow64)
     # Until EAC fixes itself, we need to force a working runner for everyone
@@ -3120,7 +4024,7 @@ install_game() {
     #debug_print continue "Your system Wine does not meet the minimum requirements for Star Citizen!"
     #debug_print continue "A custom wine runner will be automatically downloaded and used."
 
-    debug_print continue "Installing a custom wine runner..."
+    debug_print continue "Installing a custom ${runtime_label} runner..."
 
     download_dir="$install_dir/runners"
 
@@ -3132,16 +4036,8 @@ install_game() {
         return 1
     fi
 
-    wine_path="$install_dir/runners/$downloaded_item_name/bin"
+    wine_path="$(resolve_runner_bin_path "$install_dir/runners/$downloaded_item_name")"
     #fi #### Note: End of previous if statement commented out due to new EAC requirements
-
-    # Download winetricks
-    download_winetricks
-    # Abort if the winetricks download failed
-    if [ "$?" -eq 1 ]; then
-        message error "Unable to install Star Citizen without winetricks. Aborting."
-        return 1
-    fi
 
     download_rsi_installer
     # Abort if the download failed
@@ -3163,24 +4059,62 @@ install_game() {
     # Configure the wine prefix environment
     export WINE="$wine_path/wine"
     export WINESERVER="$wine_path/wineserver"
-    export WINEPREFIX="$install_dir"
+    export WINEPREFIX="$install_prefix"
     export WINEDLLOVERRIDES="dxwebsetup.exe,dotNetFx45_Full_setup.exe,winemenubuilder.exe=d"
 
     # Show a zenity pulsating progress bar
-    progress_bar start "Preparing Wine prefix and installing RSI Launcher. Please wait..."
+    progress_bar start "Preparing ${runtime_label} prefix and installing RSI Launcher. Please wait..."
 
-    # Create the new prefix and install powershell
-    debug_print continue "Preparing Wine prefix. Please wait; this will take a moment..."
-    "$winetricks_bin" -q arial tahoma dxvk powershell win11 >"$tmp_install_log" 2>&1
+    if [ "$install_runtime" = "proton" ]; then
+        # Proton installs use a dedicated pfx under the selected install root.
+        # Initialize it explicitly so the folder is ready before launcher install.
+        debug_print continue "Initializing Proton prefix at ${install_prefix}. Please wait; this will take a moment..."
+        "$wine_path"/wineboot -u >"$tmp_install_log" 2>&1
+
+        exit_code="$?"
+        if [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 126 ]; then
+            "$wine_path"/wineserver -k
+            progress_bar stop
+            if message question "${runtime_label} prefix creation failed. Aborting installation.\nThe install log was written to ${tmp_install_log_formatted}\n\nDo you want to delete\n${install_prefix}?"; then
+                debug_print continue "Deleting $install_prefix..."
+                rm -r --interactive=never "$install_prefix"
+            fi
+            return 1
+        fi
+
+        # Protontricks targets Steam app IDs and is not reliable for custom prefixes.
+        # For first-time bootstrap, use winetricks with the Proton wine binaries.
+        download_winetricks
+        if [ "$?" -eq 1 ]; then
+            "$wine_path"/wineserver -k
+            progress_bar stop
+            message error "Unable to download winetricks for Proton prefix bootstrap. Aborting."
+            return 1
+        fi
+
+        debug_print continue "Installing required libraries into Proton prefix (arial, tahoma, dxvk, powershell, win11)..."
+        "$winetricks_bin" -q arial tahoma dxvk powershell win11 >>"$tmp_install_log" 2>&1
+    else
+        # Wine installs use winetricks to prepare dependencies in the prefix.
+        set_compat_tricks
+        if [ "$?" -eq 1 ]; then
+            progress_bar stop
+            message error "Unable to install Star Citizen without a compatible tricks backend. Aborting."
+            return 1
+        fi
+
+        debug_print continue "Preparing ${runtime_label} prefix. Please wait; this will take a moment..."
+        "$tricks_bin" -q arial tahoma dxvk powershell win11 >"$tmp_install_log" 2>&1
+    fi
 
     exit_code="$?"
     if [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 126 ]; then
         # 126 = permission denied (ie. noexec on /tmp)
         "$wine_path"/wineserver -k # Kill all wine processes
         progress_bar stop # Stop the zenity progress window
-        if message question "Wine prefix creation failed. Aborting installation.\nThe install log was written to ${tmp_install_log_formatted}\n\nDo you want to delete\n${install_dir}?"; then
-            debug_print continue "Deleting $install_dir..."
-            rm -r --interactive=never "$install_dir"
+        if message question "${runtime_label} prefix creation failed. Aborting installation.\nThe install log was written to ${tmp_install_log_formatted}\n\nDo you want to delete\n${install_prefix}?"; then
+            debug_print continue "Deleting $install_prefix..."
+            rm -r --interactive=never "$install_prefix"
         fi
         return 1
     fi
@@ -3191,17 +4125,46 @@ install_game() {
     # Run the installer
     debug_print continue "Installing RSI Launcher. Please wait; this will take a moment..."
     "$wine_path"/wine "$tmp_dir/$rsi_installer" /S >>"$tmp_install_log" 2>&1
+    installer_exit_code="$?"
 
-    exit_code="$?"
-    if [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 58 ]; then
+    # Some installer versions spawn child processes and return early.
+    # Wait for the prefix to go idle before deciding success/failure.
+    "$wine_path"/wineserver -w >>"$tmp_install_log" 2>&1
+    wineserver_wait_exit_code="$?"
+
+    if [ "$installer_exit_code" -eq 1 ] || [ "$installer_exit_code" -eq 58 ] || [ "$wineserver_wait_exit_code" -ne 0 ]; then
         # User cancelled or there was an error
         "$wine_path"/wineserver -k # Kill all wine processes
         progress_bar stop # Stop the zenity progress window
-        if message question "Installation aborted.\nThe install log was written to ${tmp_install_log_formatted}\n\nDo you want to delete\n${install_dir}?"; then
-            debug_print continue "Deleting $install_dir..."
-            rm -r --interactive=never "$install_dir"
+        if message question "Installation aborted.\nThe install log was written to ${tmp_install_log_formatted}\n\nDo you want to delete\n${install_prefix}?"; then
+            debug_print continue "Deleting $install_prefix..."
+            rm -r --interactive=never "$install_prefix"
         fi
         return 0
+    fi
+
+    # Fallback: if silent install did not place the launcher, try non-silent once.
+    rsi_launcher_exe_path="${install_prefix}/${default_install_path}/RSI Launcher/RSI Launcher.exe"
+    if [ ! -f "$rsi_launcher_exe_path" ]; then
+        debug_print continue "RSI Launcher executable not detected after silent install. Retrying installer without /S..."
+        "$wine_path"/wine "$tmp_dir/$rsi_installer" >>"$tmp_install_log" 2>&1
+        installer_exit_code="$?"
+        "$wine_path"/wineserver -w >>"$tmp_install_log" 2>&1
+        wineserver_wait_exit_code="$?"
+
+        if [ "$installer_exit_code" -eq 1 ] || [ "$installer_exit_code" -eq 58 ] || [ "$wineserver_wait_exit_code" -ne 0 ]; then
+            "$wine_path"/wineserver -k
+            progress_bar stop
+            if message question "Installation aborted.
+The install log was written to ${tmp_install_log_formatted}
+
+Do you want to delete
+${install_prefix}?"; then
+                debug_print continue "Deleting $install_prefix..."
+                rm -r --interactive=never "$install_prefix"
+            fi
+            return 0
+        fi
     fi
 
     # Stop the zenity progress window
@@ -3212,17 +4175,14 @@ install_game() {
 
     # Save the install location to the Helper's config files
     reset_helper "switchprefix"
+    save_install_runtime "$install_runtime"
     wine_prefix="$install_dir"
-    if [ -d "$wine_prefix/$default_install_path" ]; then
-        game_path="$wine_prefix/$default_install_path/$sc_base_dir"
-    fi
-    getdirs
+    game_path="$install_prefix/$default_install_path/$sc_base_dir"
 
-    # Verify that we have an installed game path
-    if [ -z "$game_path" ]; then
-        message error "Something went wrong during installation. Unable to locate the expected game path. Aborting."
-        return 1
-    fi
+    # Persist install paths directly to avoid prompting for manual prefix selection.
+    mkdir -p "$conf_dir/$conf_subdir"
+    echo "$wine_prefix" > "$conf_dir/$conf_subdir/$wine_conf"
+    echo "$game_path" > "$conf_dir/$conf_subdir/$game_conf"
 
     # Ensure the LIVE directory exists. The RSI Launcher sometimes fails to create it
     mkdir -p "${game_path}/LIVE"
@@ -3255,7 +4215,7 @@ install_game() {
     installed_launch_script="$install_dir/$launch_script_name"
 
     # Update WINEPREFIX in game launch script
-    sed -i "s|^export WINEPREFIX=.*|export WINEPREFIX=\"$install_dir\"|" "$installed_launch_script"
+    sed -i "s|^export WINEPREFIX=.*|export WINEPREFIX=\"$install_prefix\"|" "$installed_launch_script"
 
     # Update Wine binary in game launch script
     post_download_sed_string="export wine_path="
@@ -3265,7 +4225,7 @@ install_game() {
     copy_icons
 
     # Create a "no_win64_warnings" file in the prefix to suppress Wine64 warnings
-    touch "${install_dir}/no_win64_warnings"
+    touch "${install_prefix}/no_win64_warnings"
 
     # Create .desktop files
     create_desktop_files
@@ -3300,7 +4260,14 @@ prepare_reinstall() {
     previous_install_path="$1"
     previous_install_basedir="$(basename "$previous_install_path")"
 
+    datap4k_relpath=""
     if [ -f "${previous_install_path}/${default_install_path}/${sc_base_dir}/LIVE/Data.p4k" ]; then
+        datap4k_relpath="${default_install_path}/${sc_base_dir}/LIVE/Data.p4k"
+    elif [ -f "${previous_install_path}/pfx/${default_install_path}/${sc_base_dir}/LIVE/Data.p4k" ]; then
+        datap4k_relpath="pfx/${default_install_path}/${sc_base_dir}/LIVE/Data.p4k"
+    fi
+
+    if [ -n "$datap4k_relpath" ]; then
         # Data.p4k exists so we can do a migration
         timestamp="$(date +'%Y%m%d-%H%M%S')"
         backed_up_install_path="${previous_install_path}-backup-${timestamp}"
@@ -3321,7 +4288,7 @@ prepare_reinstall() {
             # Stop the zenity progress window
             progress_bar stop
 
-            datap4k="${backed_up_install_path}/${default_install_path}/${sc_base_dir}/LIVE/Data.p4k"
+            datap4k="${backed_up_install_path}/${datap4k_relpath}"
             # Double check that the Data.p4k file still exists after the prefix was renamed
             if [ -f "$datap4k" ]; then
                 move_datap4k="true"
@@ -3505,7 +4472,11 @@ download_wine() {
     set_latest_default_runner
     # Sanity check
     if [ "$?" -eq 1 ]; then
-        message warning "Could not fetch the latest default wine runner.\nThe Github API may be down. Check if you are rate limited and try again later."
+        if [ -n "$api_last_http_code" ]; then
+            message warning "Could not fetch the latest default wine runner.\nGitHub API request failed (HTTP ${api_last_http_code}).\n${api_last_error_message}\n\nTip: set GITHUB_TOKEN to avoid rate limits, then try again."
+        else
+            message warning "Could not fetch the latest default wine runner.\nThe GitHub API may be down. Check if you are rate limited and try again later."
+        fi
         return 1
     fi
 
@@ -3569,6 +4540,43 @@ download_winetricks() {
     chmod +x "$winetricks_bin"
 }
 
+# MARK: set_compat_tricks()
+# Select tricks backend based on locked install runtime.
+set_compat_tricks() {
+    load_install_runtime
+    unset tricks_bin
+
+    if [ "$install_runtime" = "proton" ]; then
+        # Protontricks targets Steam app IDs. For custom prefixes created by this
+        # helper, fall back to winetricks and use the configured Proton binaries.
+        if [ -n "$WINEPREFIX" ] && printf "%s" "$WINEPREFIX" | grep -q "/steamapps/compatdata/"; then
+            if [ -x "$(command -v protontricks)" ]; then
+                tricks_bin="$(command -v protontricks)"
+                return 0
+            fi
+
+            message error "This install is locked to Proton and appears to be a Steam compatdata prefix, but 'protontricks' was not found.\nPlease install protontricks and try again."
+            return 1
+        fi
+
+        download_winetricks
+        if [ "$?" -eq 1 ]; then
+            return 1
+        fi
+        tricks_bin="$winetricks_bin"
+        return 0
+    fi
+
+    # Wine runtime uses winetricks.
+    download_winetricks
+    if [ "$?" -eq 1 ]; then
+        return 1
+    fi
+    tricks_bin="$winetricks_bin"
+
+    return 0
+}
+
 # MARK: download_rsi_installer()
 # Downloads the latest RSI setup installer to a temporary file
 download_rsi_installer() {
@@ -3610,8 +4618,8 @@ get_current_runner() {
         return 1
     fi
 
-    # Remove the last /bin directory from the path to get the runner directory
-    current_runner_path="$(dirname "$launcher_winepath")"
+    # Normalize either bin/ or files/bin layouts to the runner root.
+    current_runner_path="$(resolve_runner_root_from_bin_path "$launcher_winepath")"
     # Get the runner filename, not including its file extension
     current_runner_basename="$(basename "$current_runner_path")"
 }
@@ -3633,18 +4641,83 @@ set_latest_rsi_installer() {
 # MARK: set_latest_default_runner()
 # Fetch and store variables for the latest default wine runner filename
 set_latest_default_runner() {
-    default_runner_file="$(curl -s https://api.github.com/repos/starcitizen-lug/lug-wine/releases/latest | grep -Eo "\"browser_download_url\": ?\"[^\"]+\"" | grep -vie "staging" | cut -d '"' -f4 | xargs basename)"
-    # Important: If changing the default runner, adjust the glibc version check in the install_game function
+    load_install_runtime
+
+    default_runner_source="$(get_default_runner_source_index)"
+    if [ -z "$default_runner_source" ]; then
+        return 1
+    fi
+
+    default_runner_source_name="${runner_sources[$default_runner_source]}"
+    default_runner_api_url="${runner_sources[$((default_runner_source+1))]}"
+
+    # Filter runner assets by host architecture to avoid incompatible downloads.
+    arch_filter_keywords=""
+    system_arch="$(uname -m)"
+    case "$system_arch" in
+        x86_64 | amd64)
+            arch_filter_keywords="aarch64|arm64|armv[0-9]+|armhf|armel|riscv64|ppc64|ppc64le"
+            ;;
+        aarch64 | arm64)
+            arch_filter_keywords="x86_64|amd64|x64|i[3-6]86|x86|wow64"
+            ;;
+        *)
+            arch_filter_keywords=""
+            ;;
+    esac
+
+    if [ "$install_runtime" = "proton" ]; then
+        default_runner_payload="$(fetch_github_api_json "${default_runner_api_url}/latest")"
+        if [ -n "$arch_filter_keywords" ]; then
+            default_runner_file="$(printf "%s\n" "$default_runner_payload" | grep -Eo '"browser_download_url": ?"[^"]+"' | cut -d '"' -f4 | xargs basename | grep -E 'GE-Proton.*\.(tar\.gz|tgz|tar\.xz|tar\.zst)$' | grep -viE "$arch_filter_keywords" | head -n 1)"
+        else
+            default_runner_file="$(printf "%s\n" "$default_runner_payload" | grep -Eo '"browser_download_url": ?"[^"]+"' | cut -d '"' -f4 | xargs basename | grep -E 'GE-Proton.*\.(tar\.gz|tgz|tar\.xz|tar\.zst)$' | head -n 1)"
+        fi
+        if [ -z "$default_runner_file" ]; then
+            github_repo="$(github_repo_from_api_releases_url "$default_runner_api_url")"
+            if [ -n "$github_repo" ]; then
+                if [ -n "$arch_filter_keywords" ]; then
+                    default_runner_file="$(github_release_assets_from_html "$github_repo" | xargs -n1 basename | grep -E 'GE-Proton.*\.(tar\.gz|tgz|tar\.xz|tar\.zst)$' | grep -viE "$arch_filter_keywords" | head -n 1)"
+                else
+                    default_runner_file="$(github_release_assets_from_html "$github_repo" | xargs -n1 basename | grep -E 'GE-Proton.*\.(tar\.gz|tgz|tar\.xz|tar\.zst)$' | head -n 1)"
+                fi
+            fi
+        fi
+    else
+        default_runner_payload="$(fetch_github_api_json "${default_runner_api_url}/latest")"
+        default_runner_file="$(printf "%s\n" "$default_runner_payload" | grep -Eo '"browser_download_url": ?"[^"]+"' | grep -vie "staging" | cut -d '"' -f4 | xargs basename | grep -E '\.(tar\.gz|tgz|tar\.xz|tar\.zst)$' | head -n 1)"
+        if [ -z "$default_runner_file" ]; then
+            github_repo="$(github_repo_from_api_releases_url "$default_runner_api_url")"
+            if [ -n "$github_repo" ]; then
+                default_runner_file="$(github_release_assets_from_html "$github_repo" | xargs -n1 basename | grep -vi "staging" | grep -E '\.(tar\.gz|tgz|tar\.xz|tar\.zst)$' | head -n 1)"
+            fi
+        fi
+    fi
+
+    # Important: If changing default runner requirements, adjust glibc checks in install_game.
 
     if [ -z "$default_runner_file" ]; then
         return 1
     fi
 
     # Store the filename without the file extension
-    default_runner="$(basename "$default_runner_file" .tar.gz)"
-
-    # Set the runner_sources array index which points to the default runner source api url (must be an even number in the array, arrays start with 0)
-    default_runner_source=0
+    case "$default_runner_file" in
+        *.tar.gz)
+            default_runner="$(basename "$default_runner_file" .tar.gz)"
+            ;;
+        *.tgz)
+            default_runner="$(basename "$default_runner_file" .tgz)"
+            ;;
+        *.tar.xz)
+            default_runner="$(basename "$default_runner_file" .tar.xz)"
+            ;;
+        *.tar.zst)
+            default_runner="$(basename "$default_runner_file" .tar.zst)"
+            ;;
+        *)
+            default_runner="$(basename "$default_runner_file")"
+            ;;
+    esac
 }
 
 # MARK: set_latest_winetricks()
@@ -3807,11 +4880,11 @@ Usage: lug-helper <options>
   -p, --preflight-check         Run system optimization checks
   -i, --install                 Install Star Citizen
   -m, --manage-runners          Install or remove Wine runners
-  -k, --manage-dxvk             Manage DXVK in the Wine prefix
+    -k, --manage-dxvk             Manage DXVK in the configured runtime prefix
   -u, --update-launch-script    Update/Repair the game launch script
   -e, --edit-launch-script      Edit the game launch script
-  -c, --wine-config             Launch winecfg for the game's prefix
-  -j, --wine-controllers        Launch Wine controllers configuration
+    -c, --wine-config             Launch runtime prefix configuration
+    -j, --wine-controllers        Launch runtime controller configuration
   -l, --update-rsi-launcher     Update/Re-install RSI Launcher
   -d, --show-directories        Show all Star Citizen and Helper directories
   -w, --show-wiki               Show the LUG Wiki
@@ -3927,6 +5000,10 @@ fi
 # MARK: Main Menu
 # Loop the main menu until the user selects quit
 while true; do
+    load_install_runtime
+    runtime_label="$(get_runtime_label)"
+    install_menu_action="install_game"
+
     # Configure the menu
     menu_text_zenity="$menu_heading_zenity"
     menu_text_terminal="$menu_heading_terminal"
@@ -3936,8 +5013,13 @@ while true; do
 
     # Configure the menu options
     preflight_msg="Preflight Check (System Optimization)"
-    install_msg_wine="Install Star Citizen Launcher"
-    runners_msg_wine="Manage Wine Runners"
+    if current_target_install_is_valid; then
+        install_msg_wine="Uninstall Star Citizen (${current_target_install_runtime^})"
+        install_menu_action="uninstall_game"
+    else
+        install_msg_wine="Install Star Citizen Launcher (${runtime_label})"
+    fi
+    runners_msg_wine="Manage ${runtime_label} Runners"
     dxvk_msg_wine="Manage DXVK"
     maintenance_msg="Maintenance and Troubleshooting"
     about_msg="About and Support"
@@ -3945,7 +5027,7 @@ while true; do
     # Set the options to be displayed in the menu
     menu_options=("$preflight_msg" "$install_msg_wine" "$runners_msg_wine" "$dxvk_msg_wine" "$maintenance_msg" "$about_msg" "quit")
     # Set the corresponding functions to be called for each of the options
-    menu_actions=("preflight_check" "install_game" "runner_manage" "dxvk_menu" "maintenance_menu" "about_info" "quit")
+    menu_actions=("preflight_check" "$install_menu_action" "runner_manage" "dxvk_menu" "maintenance_menu" "about_info" "quit")
 
     # Calculate the total height the menu should be
     # menu_option_height = pixels per menu option
