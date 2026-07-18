@@ -686,7 +686,7 @@ getdirs() {
     # ask the user to provide them
     if [ -z "$wine_prefix" ] || [ -z "$game_path" ]; then
         if [ "$install_runtime" = "proton" ]; then
-            message info "At the next screen, please select the Star Citizen install root directory.\nYour Proton prefix is expected at [install root]/pfx and will be remembered for future use.\n\nDefault install path: ~/Games/star-citizen"
+            message info "At the next screen, please select the Star Citizen install root directory.\nThe selected directory will be used directly as your Proton prefix and a 'pfx' symlink will point to it for compatibility.\n\nDefault install path: ~/Games/star-citizen"
         else
             message info "At the next screen, please select the directory where you installed Star Citizen (your ${runtime_label} prefix)\nIt will be remembered for future use.\n\nDefault install path: ~/Games/star-citizen"
         fi
@@ -889,7 +889,11 @@ detect_install_runtime_from_root() {
         if [ -n "$launch_wineprefix" ] && [ "$(basename "$launch_wineprefix")" = "pfx" ]; then
             proton_score="$((proton_score+3))"
         elif [ -n "$launch_wineprefix" ] && [ "$launch_wineprefix" = "$install_root" ]; then
-            wine_score="$((wine_score+3))"
+            if [ -L "$install_root/pfx" ] && [ "$(realpath "$install_root/pfx" 2>/dev/null)" = "$(realpath "$install_root" 2>/dev/null)" ]; then
+                proton_score="$((proton_score+3))"
+            else
+                wine_score="$((wine_score+3))"
+            fi
         fi
 
         if printf "%s" "$launch_winepath" | grep -qi "proton"; then
@@ -990,6 +994,8 @@ current_target_install_is_valid() {
 
     if [ "$current_target_install_runtime" = "proton" ]; then
         if [ "$(basename "$current_target_install_root")" = "pfx" ]; then
+            current_target_effective_prefix="$current_target_install_root"
+        elif [ -L "$current_target_install_root/pfx" ] && [ "$(realpath "$current_target_install_root/pfx" 2>/dev/null)" = "$(realpath "$current_target_install_root" 2>/dev/null)" ]; then
             current_target_effective_prefix="$current_target_install_root"
         else
             current_target_effective_prefix="$current_target_install_root/pfx"
@@ -1315,6 +1321,8 @@ resolve_effective_wineprefix() {
     if [ "$install_runtime" = "proton" ]; then
         if [ "$(basename "$prefix_root")" = "pfx" ]; then
             printf "%s" "$prefix_root"
+        elif [ -L "$prefix_root/pfx" ] && [ "$(realpath "$prefix_root/pfx" 2>/dev/null)" = "$(realpath "$prefix_root" 2>/dev/null)" ]; then
+            printf "%s" "$prefix_root"
         else
             printf "%s" "$prefix_root/pfx"
         fi
@@ -1325,6 +1333,34 @@ resolve_effective_wineprefix() {
             printf "%s" "$prefix_root"
         fi
     fi
+}
+
+# MARK: ensure_proton_prefix_symlink()
+# Ensure install_root/pfx points back to install_root for compatibility.
+ensure_proton_prefix_symlink() {
+    if [ "$#" -lt 1 ]; then
+        debug_print exit "Script error: The ensure_proton_prefix_symlink function expects one argument. Aborting."
+    fi
+
+    install_root="$1"
+    if [ -z "$install_root" ] || [ ! -d "$install_root" ]; then
+        return 1
+    fi
+
+    pfx_link_path="$install_root/pfx"
+
+    # Leave legacy real-directory pfx layouts untouched.
+    if [ -e "$pfx_link_path" ] && [ ! -L "$pfx_link_path" ]; then
+        return 0
+    fi
+
+    # Already correct.
+    if [ -L "$pfx_link_path" ] && [ "$(realpath "$pfx_link_path" 2>/dev/null)" = "$(realpath "$install_root" 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    rm -f "$pfx_link_path" 2>/dev/null
+    ln -s . "$pfx_link_path" 2>/dev/null
 }
 
 # MARK: resolve_runner_bin_path()
@@ -3902,7 +3938,7 @@ install_game() {
         install_dir="$HOME/Games/star-citizen"
 
         if [ "$install_runtime" = "proton" ]; then
-            install_prefix="$install_dir/pfx"
+            install_prefix="$install_dir"
         else
             install_prefix="$install_dir"
         fi
@@ -3941,7 +3977,7 @@ install_game() {
             fi
 
             if [ "$install_runtime" = "proton" ]; then
-                install_prefix="$install_dir/pfx"
+                install_prefix="$install_dir"
             else
                 install_prefix="$install_dir"
             fi
@@ -3972,7 +4008,7 @@ install_game() {
                 esac
 
                 if [ "$install_runtime" = "proton" ]; then
-                    install_prefix="$install_dir/pfx"
+                    install_prefix="$install_dir"
                 else
                     install_prefix="$install_dir"
                 fi
@@ -4003,7 +4039,7 @@ install_game() {
 
     if [ -z "$install_prefix" ]; then
         if [ "$install_runtime" = "proton" ]; then
-            install_prefix="$install_dir/pfx"
+            install_prefix="$install_dir"
         else
             install_prefix="$install_dir"
         fi
@@ -4012,6 +4048,12 @@ install_game() {
     # Create the game path
     mkdir -p "$install_dir"
     mkdir -p "$install_prefix"
+    if [ "$install_runtime" = "proton" ]; then
+        if ! ensure_proton_prefix_symlink "$install_dir"; then
+            message error "Unable to create compatibility symlink at:\n${install_dir}/pfx\n\nAborting installation."
+            return 1
+        fi
+    fi
 
     # EAC doesn't like >10.0 wine or wow64 wine (all new wines are wow64)
     # Until EAC fixes itself, we need to force a working runner for everyone
@@ -4066,8 +4108,8 @@ install_game() {
     progress_bar start "Preparing ${runtime_label} prefix and installing RSI Launcher. Please wait..."
 
     if [ "$install_runtime" = "proton" ]; then
-        # Proton installs use a dedicated pfx under the selected install root.
-        # Initialize it explicitly so the folder is ready before launcher install.
+        # Proton installs use the selected install root directly as WINEPREFIX.
+        # Keep install_root/pfx as a compatibility symlink to that same directory.
         debug_print continue "Initializing Proton prefix at ${install_prefix}. Please wait; this will take a moment..."
         "$wine_path"/wineboot -u >"$tmp_install_log" 2>&1
 

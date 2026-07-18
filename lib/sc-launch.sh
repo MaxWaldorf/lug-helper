@@ -6,15 +6,14 @@
 # Usage:
 # Run from your terminal or use the .desktop files installed by the Helper.
 #
-# version: 2.8
+# version: 2.6
 # License: GPLv3.0
 
 ############################################################################
 # ENVIRONMENT VARIABLES
 ############################################################################
-# Only keep broadly safe defaults enabled here.
-# Proton-required variables are applied further below when a Proton runner is detected.
-# Optional GPU- or Wayland-specific overrides are listed disabled by default.
+# Keep user-tunable exports grouped here for easy edits.
+# Runtime-specific values are exported later in the matching runtime blocks.
 ############################################################################
 export WINEPREFIX="$HOME/Games/star-citizen"
 
@@ -22,19 +21,11 @@ launch_log="$WINEPREFIX/sc-launch.log"
 # Force X11/XWayland unless the user explicitly opts into a Wayland workaround below.
 unset SDL_VIDEODRIVER
 
+########################
+# Shared (Wine + Proton)
+########################
 export WINEDLLOVERRIDES="winemenubuilder.exe=d" # Prevent updates from overwriting our .desktop entries
 export WINEDEBUG=-all # Cut down on console debug messages
-
-# Optional Nvidia shader cache tuning
-#export __GL_SHADER_DISK_CACHE=1
-#export __GL_SHADER_DISK_CACHE_SIZE=10737418240
-#export __GL_SHADER_DISK_CACHE_PATH="$WINEPREFIX"
-#export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
-
-# Optional Mesa shader cache tuning (AMD/Intel)
-#export MESA_SHADER_CACHE_DIR="$WINEPREFIX"
-#export MESA_SHADER_CACHE_MAX_SIZE="10G"
-
 # Performance options
 #export DXVK_ASYNC=1
 #export WINEESYNC=1
@@ -42,10 +33,37 @@ export WINEDEBUG=-all # Cut down on console debug messages
 # Optional HUDs
 #export DXVK_HUD=fps,compiler
 #export MANGOHUD=1
+#export MANGOHUD_CONFIG=fps,frametime,version
 
-# Optional Wayland workarounds
-# Keep these disabled unless you are troubleshooting a specific Wayland issue.
-#export SDL_VIDEODRIVER=wayland
+########################
+# NVIDIA-only
+########################
+# Optional Nvidia shader cache tuning
+#export __GL_SHADER_DISK_CACHE=1
+#export __GL_SHADER_DISK_CACHE_SIZE=10737418240
+#export __GL_SHADER_DISK_CACHE_PATH="$WINEPREFIX"
+#export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
+# Auto-enable NVAPI in Proton when Nvidia is detected.
+export ENABLE_PROTON_NVAPI_AUTODETECT=1
+# Manual Proton NVAPI overrides (take precedence if set)
+#export PROTON_ENABLE_NVAPI=1
+#export PROTON_HIDE_NVIDIA_GPU=0
+
+########################
+# AMD / Intel (Mesa)
+########################
+#export MESA_SHADER_CACHE_DIR="$WINEPREFIX"
+#export MESA_SHADER_CACHE_MAX_SIZE="10G"
+
+########################
+# Wine-only
+########################
+#export STAGING_SHARED_MEMORY=1
+
+########################
+# Proton-only
+########################
+# Keep disabled unless troubleshooting Wayland-specific issues.
 #export PROTON_ENABLE_WAYLAND=1
 
 ############################################################################
@@ -59,6 +77,166 @@ export WINEDEBUG=-all # Cut down on console debug messages
 # export wine_path="/path/to/custom/runner/bin"
 export wine_path="$(command -v wine | xargs dirname)"
 
+resolve_runner_root_from_bin_path() {
+    local runner_bin_path runner_parent
+    runner_bin_path="$1"
+
+    if [ "$(basename "$runner_bin_path")" = "bin" ]; then
+        runner_parent="$(dirname "$runner_bin_path")"
+        if [ "$(basename "$runner_parent")" = "files" ]; then
+            dirname "$runner_parent"
+            return 0
+        fi
+        printf "%s" "$runner_parent"
+        return 0
+    fi
+
+    printf "%s" "$runner_bin_path"
+}
+
+setup_openxr_vr_env() {
+    custom_wivrn_runtime_json=""
+
+    if [ -z "${XR_RUNTIME_JSON:-}" ]; then
+        custom_wivrn_runtime_json="$(ensure_wivrn_runtime_json)"
+        if [ -n "$custom_wivrn_runtime_json" ] && [ -f "$custom_wivrn_runtime_json" ]; then
+            export XR_RUNTIME_JSON="$custom_wivrn_runtime_json"
+        fi
+    fi
+
+    # Respect user-provided runtime settings.
+    if [ -z "${XR_RUNTIME_JSON:-}" ]; then
+        if [ -n "${XDG_CONFIG_HOME:-}" ] && [ -f "${XDG_CONFIG_HOME}/openxr/1/active_runtime.json" ]; then
+            export XR_RUNTIME_JSON="${XDG_CONFIG_HOME}/openxr/1/active_runtime.json"
+        elif [ -f "$HOME/.config/openxr/1/active_runtime.json" ]; then
+            export XR_RUNTIME_JSON="$HOME/.config/openxr/1/active_runtime.json"
+        elif [ -f "/usr/share/openxr/1/openxr_wivrn.json" ]; then
+            export XR_RUNTIME_JSON="/usr/share/openxr/1/openxr_wivrn.json"
+        elif [ -f "/usr/share/openxr/1/openxr_monado.json" ]; then
+            export XR_RUNTIME_JSON="/usr/share/openxr/1/openxr_monado.json"
+        fi
+    fi
+
+    # Ensure pressure-vessel can see host OpenXR IPC sockets used by WiVRn/Monado.
+    xr_rw_paths=""
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        for xr_path in "$XDG_RUNTIME_DIR/wivrn" "$XDG_RUNTIME_DIR/monado_comp_ipc"; do
+            if [ -e "$xr_path" ]; then
+                if [ -n "$xr_rw_paths" ]; then
+                    xr_rw_paths="${xr_rw_paths}:$xr_path"
+                else
+                    xr_rw_paths="$xr_path"
+                fi
+            fi
+        done
+    fi
+
+    if [ -n "$xr_rw_paths" ]; then
+        if [ -n "${PRESSURE_VESSEL_FILESYSTEMS_RW:-}" ]; then
+            export PRESSURE_VESSEL_FILESYSTEMS_RW="${PRESSURE_VESSEL_FILESYSTEMS_RW}:$xr_rw_paths"
+        else
+            export PRESSURE_VESSEL_FILESYSTEMS_RW="$xr_rw_paths"
+        fi
+    fi
+}
+
+ensure_wivrn_runtime_json() {
+    local xr_json_out home_lib sys_lib search_path
+
+    xr_json_out="$WINEPREFIX/xr-wivrn-runtime.json"
+    home_lib="$HOME/.local/lib/wivrn/libopenxr_wivrn.so"
+    sys_lib=""
+
+    for search_path in \
+        /usr/lib/wivrn/libopenxr_wivrn.so \
+        /usr/lib/x86_64-linux-gnu/wivrn/libopenxr_wivrn.so \
+        /usr/lib64/wivrn/libopenxr_wivrn.so \
+        /usr/local/lib/wivrn/libopenxr_wivrn.so; do
+        if [ -f "$search_path" ]; then
+            sys_lib="$search_path"
+            break
+        fi
+    done
+
+    if [ -n "$sys_lib" ] && { [ ! -f "$home_lib" ] || [ "$sys_lib" -nt "$home_lib" ]; }; then
+        mkdir -p "$HOME/.local/lib/wivrn"
+        cp -p "$sys_lib" "$home_lib" 2>/dev/null || true
+    fi
+
+    if [ ! -f "$home_lib" ]; then
+        return 1
+    fi
+
+    printf '{\n    "file_format_version": "1.0.0",\n    "runtime": {\n        "name": "WiVRn",\n        "library_path": "%s"\n    }\n}\n' "$home_lib" > "$xr_json_out"
+    printf "%s" "$xr_json_out"
+}
+
+ensure_wine_vr_key() {
+    local proton_path compat_client_path reg_file vk_pair vk_vid vk_pid vid_dword pid_dword
+
+    proton_path="$1"
+    if [ -z "$proton_path" ] || [ ! -x "$proton_path/proton" ]; then
+        return 0
+    fi
+
+    compat_client_path="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$proton_path}"
+
+    if env WINEPREFIX="$WINEPREFIX" \
+        STEAM_COMPAT_DATA_PATH="$WINEPREFIX" \
+        STEAM_COMPAT_CLIENT_INSTALL_PATH="$compat_client_path" \
+        UMU_ID=0 \
+        "$proton_path/proton" run reg query "HKCU\\Software\\Wine\\VR" /v state >/dev/null 2>&1; then
+        return 0
+    fi
+
+    reg_file="$WINEPREFIX/drive_c/wivrn_vr_init.reg"
+    vk_vid=""
+    vk_pid=""
+    vid_dword=""
+    pid_dword=""
+
+    if command -v vulkaninfo >/dev/null 2>&1; then
+        vk_pair="$(vulkaninfo --summary 2>/dev/null | awk '
+            /vendorID/{vid=$3}
+            /deviceID/{did=$3}
+            /DISCRETE_GPU/{print vid " " did; found=1; exit}
+            END{if(!found && vid && did) print vid " " did}
+        ')"
+        if [ -n "$vk_pair" ]; then
+            vk_vid="${vk_pair%% *}"
+            vk_pid="${vk_pair##* }"
+        fi
+    fi
+
+    if [ -n "$vk_vid" ] && [ -n "$vk_pid" ]; then
+        vid_dword="$(printf '%08x' "$((16#${vk_vid#0x}))" 2>/dev/null)"
+        pid_dword="$(printf '%08x' "$((16#${vk_pid#0x}))" 2>/dev/null)"
+    fi
+
+    cat > "$reg_file" <<REGEOF
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\\Software\\Wine\\VR]
+"openxr_vulkan_instance_extensions"="VK_KHR_external_fence_capabilities VK_KHR_external_memory_capabilities VK_KHR_external_semaphore_capabilities VK_KHR_get_physical_device_properties2"
+"openxr_vulkan_device_extensions"="VK_KHR_dedicated_allocation VK_KHR_external_fence VK_KHR_external_memory VK_KHR_external_semaphore VK_KHR_get_memory_requirements2 VK_KHR_image_format_list VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_external_fence_fd"
+"state"=dword:00000001
+"is_hmd_present"=dword:00000001
+REGEOF
+
+    if [ -n "$vid_dword" ] && [ -n "$pid_dword" ]; then
+        printf '"openxr_vulkan_device_vid"=dword:%s\n' "$vid_dword" >> "$reg_file"
+        printf '"openxr_vulkan_device_pid"=dword:%s\n' "$pid_dword" >> "$reg_file"
+    fi
+
+    env WINEPREFIX="$WINEPREFIX" \
+        STEAM_COMPAT_DATA_PATH="$WINEPREFIX" \
+        STEAM_COMPAT_CLIENT_INSTALL_PATH="$compat_client_path" \
+        UMU_ID=0 \
+        "$proton_path/proton" run regedit /s "C:\\wivrn_vr_init.reg" >/dev/null 2>&1 || true
+
+    rm -f "$reg_file"
+}
+
 # Detect runtime from configured runner path for user-facing messages.
 runtime_label="Wine"
 if printf "%s" "$wine_path" | grep -qi "proton"; then
@@ -67,9 +245,12 @@ fi
 
 # Proton-specific defaults for non-Steam prefixes created by this helper.
 # These are only applied when a Proton runner is configured.
+# Current helper layout uses the selected install root directly as WINEPREFIX
+# and creates a compatibility pfx symlink that points back to that same root.
 if [ "$runtime_label" = "Proton" ]; then
     # Required when launching Proton outside Steam with a non-Steam prefix.
     export STEAM_COMPAT_DATA_PATH="$WINEPREFIX"
+    export PROTON_GAMEID="umu-starcitizen"
 
     # Recommended when a local Steam install exists.
     if [ -d "$HOME/.steam/steam" ]; then
@@ -78,9 +259,11 @@ if [ "$runtime_label" = "Proton" ]; then
         export STEAM_COMPAT_CLIENT_INSTALL_PATH="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$HOME/.local/share/Steam}"
     fi
 
-    # Optional Proton tuning examples
-    #export PROTON_ENABLE_NVAPI=1
-    #export PROTON_HIDE_NVIDIA_GPU=0
+    # Improve VRAM reporting on Nvidia by exposing NVAPI in Proton.
+    if [ "${ENABLE_PROTON_NVAPI_AUTODETECT:-1}" = "1" ] && [ -e "/proc/driver/nvidia/version" ]; then
+        export PROTON_ENABLE_NVAPI="${PROTON_ENABLE_NVAPI:-1}"
+        export PROTON_HIDE_NVIDIA_GPU="${PROTON_HIDE_NVIDIA_GPU:-0}"
+    fi
 fi
 
 ########################
@@ -118,4 +301,18 @@ update_check() {
 ############################################################################
 # Launch the game
 ############################################################################
-"$wine_path"/wine "C:\Program Files\Roberts Space Industries\RSI Launcher\RSI Launcher.exe" > "$launch_log" 2>&1
+if [ "$runtime_label" = "Proton" ]; then
+    if [ -x "$(command -v umu-run)" ]; then
+        GAMEID="${PROTON_GAMEID:-umu-starcitizen}"
+        export PROTONPATH="$(resolve_runner_root_from_bin_path "$wine_path")"
+        export GAMEID
+        ensure_wine_vr_key "$PROTONPATH"
+        setup_openxr_vr_env
+        umu-run "C:\Program Files\Roberts Space Industries\RSI Launcher\RSI Launcher.exe" > "$launch_log" 2>&1
+    else
+        echo "Proton runner detected, but umu-run is not installed. Falling back to direct runner launch." >&2
+        "$wine_path"/wine "C:\Program Files\Roberts Space Industries\RSI Launcher\RSI Launcher.exe" > "$launch_log" 2>&1
+    fi
+else
+    "$wine_path"/wine "C:\Program Files\Roberts Space Industries\RSI Launcher\RSI Launcher.exe" > "$launch_log" 2>&1
+fi
