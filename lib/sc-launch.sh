@@ -18,8 +18,15 @@
 export WINEPREFIX="$HOME/Games/star-citizen"
 
 launch_log="$WINEPREFIX/sc-launch.log"
+launcher_win_path="C:\Program Files\Roberts Space Industries\RSI Launcher\RSI Launcher.exe"
+launcher_host_path="$WINEPREFIX/drive_c/Program Files/Roberts Space Industries/RSI Launcher/RSI Launcher.exe"
 # Force X11/XWayland unless the user explicitly opts into a Wayland workaround below.
 unset SDL_VIDEODRIVER
+
+trace_launch_log() {
+    mkdir -p "$WINEPREFIX"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$launch_log"
+}
 
 ########################
 # Shared (Wine + Proton)
@@ -92,6 +99,84 @@ resolve_runner_root_from_bin_path() {
     fi
 
     printf "%s" "$runner_bin_path"
+}
+
+detect_system_xkb_layout() {
+    local layout
+
+    if [ -n "${XKB_DEFAULT_LAYOUT:-}" ]; then
+        layout="$XKB_DEFAULT_LAYOUT"
+    elif command -v setxkbmap >/dev/null 2>&1; then
+        layout="$(setxkbmap -query 2>/dev/null | awk '/layout:/ {print $2; exit}')"
+    elif command -v localectl >/dev/null 2>&1; then
+        layout="$(localectl status 2>/dev/null | awk -F': *' '/X11 Layout/ {print $2; exit}')"
+    fi
+
+    layout="${layout%%,*}"
+    printf "%s" "$(printf "%s" "$layout" | tr '[:upper:]' '[:lower:]')"
+}
+
+map_xkb_layout_to_windows_klid() {
+    case "$1" in
+        us) printf "00000409" ;;
+        gb) printf "00000809" ;;
+        de) printf "00000407" ;;
+        fr) printf "0000040c" ;;
+        it) printf "00000410" ;;
+        es) printf "0000040a" ;;
+        pt) printf "00000816" ;;
+        br) printf "00000416" ;;
+        ru) printf "00000419" ;;
+        ua) printf "00000422" ;;
+        pl) printf "00000415" ;;
+        cs) printf "00000405" ;;
+        tr) printf "0000041f" ;;
+        fi) printf "0000040b" ;;
+        se) printf "0000041d" ;;
+        no) printf "00000414" ;;
+        dk) printf "00000406" ;;
+        hu) printf "0000040e" ;;
+        ro) printf "00000418" ;;
+        nl) printf "00000413" ;;
+        be) printf "00000813" ;;
+    esac
+}
+
+sync_windows_keyboard_layout() {
+    local runtime_name proton_path xkb_layout klid
+
+    runtime_name="$1"
+    proton_path="$2"
+    xkb_layout="$(detect_system_xkb_layout)"
+    klid="$(map_xkb_layout_to_windows_klid "$xkb_layout")"
+
+    if [ -z "$xkb_layout" ]; then
+        trace_launch_log "keyboard-layout: could not detect system XKB layout"
+        return 0
+    fi
+
+    if [ -z "$klid" ]; then
+        trace_launch_log "keyboard-layout: XKB '$xkb_layout' is not mapped; leaving current Wine/Proton layout unchanged"
+        return 0
+    fi
+
+    if [ "$runtime_name" = "Proton" ] && [ -n "$proton_path" ] && [ -x "$proton_path/proton" ]; then
+        if env WINEPREFIX="$WINEPREFIX" \
+            STEAM_COMPAT_DATA_PATH="$WINEPREFIX" \
+            STEAM_COMPAT_CLIENT_INSTALL_PATH="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$proton_path}" \
+            UMU_ID=0 \
+            "$proton_path/proton" run reg add "HKCU\\Keyboard Layout\\Preload" /v 1 /t REG_SZ /d "$klid" /f >/dev/null 2>&1; then
+            trace_launch_log "keyboard-layout: applied XKB '$xkb_layout' -> KLID '$klid' (Proton)"
+        else
+            trace_launch_log "keyboard-layout: failed to apply XKB '$xkb_layout' -> KLID '$klid' (Proton)"
+        fi
+    else
+        if "$wine_path"/wine reg add "HKCU\\Keyboard Layout\\Preload" /v 1 /t REG_SZ /d "$klid" /f >/dev/null 2>&1; then
+            trace_launch_log "keyboard-layout: applied XKB '$xkb_layout' -> KLID '$klid' (Wine)"
+        else
+            trace_launch_log "keyboard-layout: failed to apply XKB '$xkb_layout' -> KLID '$klid' (Wine)"
+        fi
+    fi
 }
 
 setup_openxr_vr_env() {
@@ -251,6 +336,7 @@ if [ "$runtime_label" = "Proton" ]; then
     # Required when launching Proton outside Steam with a non-Steam prefix.
     export STEAM_COMPAT_DATA_PATH="$WINEPREFIX"
     export PROTON_GAMEID="umu-starcitizen"
+    export PROTONPATH="$(resolve_runner_root_from_bin_path "$wine_path")"
 
     # Recommended when a local Steam install exists.
     if [ -d "$HOME/.steam/steam" ]; then
@@ -298,21 +384,35 @@ update_check() {
 }
 "$wine_path"/wineserver -k
 
+# Start a fresh launch log and preserve pre-launch traces.
+: > "$launch_log"
+trace_launch_log "launch-start: runtime=$runtime_label prefix=$WINEPREFIX"
+
 ############################################################################
 # Launch the game
 ############################################################################
 if [ "$runtime_label" = "Proton" ]; then
     if [ -x "$(command -v umu-run)" ]; then
+        launcher_umu_target="$launcher_win_path"
+        if [ -f "$launcher_host_path" ]; then
+            launcher_umu_target="$launcher_host_path"
+            trace_launch_log "launch-target: using host path for umu-run ($launcher_host_path)"
+        else
+            trace_launch_log "launch-target: host path missing, falling back to Wine path for umu-run ($launcher_win_path)"
+        fi
         GAMEID="${PROTON_GAMEID:-umu-starcitizen}"
-        export PROTONPATH="$(resolve_runner_root_from_bin_path "$wine_path")"
         export GAMEID
         ensure_wine_vr_key "$PROTONPATH"
+        sync_windows_keyboard_layout "$runtime_label" "$PROTONPATH"
         setup_openxr_vr_env
-        umu-run "C:\Program Files\Roberts Space Industries\RSI Launcher\RSI Launcher.exe" > "$launch_log" 2>&1
+        umu-run "$launcher_umu_target" >> "$launch_log" 2>&1
     else
         echo "Proton runner detected, but umu-run is not installed. Falling back to direct runner launch." >&2
-        "$wine_path"/wine "C:\Program Files\Roberts Space Industries\RSI Launcher\RSI Launcher.exe" > "$launch_log" 2>&1
+        trace_launch_log "launch-warning: umu-run missing, using direct Wine command with Proton runner"
+        sync_windows_keyboard_layout "$runtime_label" "$PROTONPATH"
+        "$wine_path"/wine "$launcher_win_path" >> "$launch_log" 2>&1
     fi
 else
-    "$wine_path"/wine "C:\Program Files\Roberts Space Industries\RSI Launcher\RSI Launcher.exe" > "$launch_log" 2>&1
+    sync_windows_keyboard_layout "$runtime_label" ""
+    "$wine_path"/wine "$launcher_win_path" >> "$launch_log" 2>&1
 fi
